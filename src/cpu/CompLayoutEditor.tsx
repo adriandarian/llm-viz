@@ -3,7 +3,7 @@ import React, { memo, useEffect, useLayoutEffect, useMemo, useReducer, useRef, u
 import { ViewLayoutContext, editSnapshot, editSnapshotDirect, useEditorContext, useViewLayout } from './Editor';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faCaretRight, faPlus } from '@fortawesome/free-solid-svg-icons';
-import { Gripper, ICompPortConfig, compPortDefId } from './comps/CompPort';
+import { ICompPortConfig, compPortDefId } from './comps/CompPort';
 import { pluralize } from '../utils/text';
 import { assignImm, clamp, hasFlag, isNotNil, makeArray } from '../utils/data';
 import { Vec3 } from '../utils/vector';
@@ -13,9 +13,10 @@ import { multiSortStableAsc } from '../utils/array';
 import { paletteTw } from './palette';
 import { AffineMat2d } from '../utils/AffineMat2d';
 import { IPointerEvent, useCombinedMouseTouchDrag } from '../utils/pointer';
-import { drawGrid } from './CanvasRenderHelpers';
+import { drawGrid } from './render/CanvasRenderHelpers';
 import { CursorDragOverlay } from '../utils/CursorDragOverlay';
 import { useFunctionRef } from '../utils/hooks';
+import { SideGripper } from './comps/CompResizing';
 
 /*
 
@@ -47,7 +48,7 @@ Might have to change ICpuLayout and split an interface off that goes into the ed
 export const CompLayoutToolbar: React.FC<{
     className?: string;
 }> = memo(function CompLayoutToolbar({ className }) {
-    let { editorState, setEditorState } = useEditorContext();
+    let [editorState, setEditorState] = useEditorContext();
     let [isExpanded, setIsExpanded] = useState(false);
 
     let snapshot = editorState.snapshotTemp ?? editorState.snapshot;
@@ -101,7 +102,7 @@ export const CompLayoutToolbar: React.FC<{
 export const CompLayoutEditor: React.FC<{
 
 }> = memo(function CompLayoutEditor({ }) {
-    let { editorState, setEditorState } = useEditorContext();
+    let [editorState, setEditorState] = useEditorContext();
     let [canvasWrapEl, setCanvasWrapEl] = useState<HTMLDivElement | null>(null);
     let [canvaEl, setCanvasEl] = useState<HTMLCanvasElement | null>(null);
     let [compPos, setCompPos] = useState(new Vec3());
@@ -323,7 +324,7 @@ export const CompBoxEditor: React.FC<{
     size: Vec3;
     setPos: (end: boolean, pos: Vec3) => void;
 }> = memo(function CompBoxEditor({ pos, size, setPos }) {
-    let { setEditorState } = useEditorContext();
+    let [, setEditorState] = useEditorContext();
     let { mtx, el } = useViewLayout();
     let [boxEl, setBoxEl] = useState<HTMLDivElement | null>(null);
 
@@ -355,7 +356,7 @@ export const CompBoxEditor: React.FC<{
             style={{ width: size.x * zoom, height: size.y * zoom, transform: `translate(${pos.x}px, ${pos.y}px) scale(${1/zoom})` }}
         >
             {makeArray(4).map((_, i) => {
-                return <Gripper key={i} gripPos={i} pos={pos} size={size} onResize={handleResize} />;
+                return <SideGripper key={i} gripPos={i} pos={pos} size={size} onResize={handleResize} />;
             })}
         </div>
         {/* <div
@@ -375,7 +376,7 @@ export const CompPortEditor: React.FC<{
     draggingPortIdx: number | null;
     setDraggingPortIdx: (idx: number | null) => void;
 }> = memo(function CompPortEditor({ portIdx, compPos, compSize, schematicComp, port, draggingPortIdx, setDraggingPortIdx }) {
-    let { setEditorState } = useEditorContext();
+    let [, setEditorState] = useEditorContext();
     let { mtx, el } = useViewLayout();
     let [portEl, setPortEl] = useState<HTMLDivElement | null>(null);
 

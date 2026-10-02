@@ -1,6 +1,6 @@
 'use client';
 
-import React, { Suspense, useEffect } from 'react';
+import React, { Suspense, memo, useEffect } from 'react';
 import { useCreateGlobalKeyboardDocumentListener } from '../utils/keyboard';
 import { CpuCanvas } from './CpuCanvas';
 import s from './CpuMain.module.scss';
@@ -8,8 +8,8 @@ import { Header } from '../homepage/Header';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faBars } from '@fortawesome/free-solid-svg-icons';
 import { IProgramState } from './CpuModel';
-import { CompLibrary } from './comps/CompBuilder';
-import { SchematicLibrary } from './schematics/SchematicLibrary';
+import { CompLibrary } from './library/CompLibrary';
+import { SchematicLibrary } from './library/SchematicLibrary';
 import { useEditorContext } from './Editor';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useFunctionRef } from '../utils/hooks';
@@ -57,10 +57,10 @@ export const CPUMain = () => {
 };
 
 const QueryUpdater: React.FC<{
-}> = () => {
+}> = memo(function QueryUpdater() {
     let router = useRouter();
     let searchParams = useSearchParams();
-    let { editorState, setEditorState } = useEditorContext();
+    let [editorState, setEditorState] = useEditorContext();
 
     let schematicId = searchParams.get('schematicId');
 
@@ -84,7 +84,7 @@ const QueryUpdater: React.FC<{
     }, [schematicId, setEditorState]);
 
     return null;
-};
+});
 
 function updateQuery(searchParams: URLSearchParams, changes: Record<string, string | null>) {
     let params = new URLSearchParams(searchParams.toString());

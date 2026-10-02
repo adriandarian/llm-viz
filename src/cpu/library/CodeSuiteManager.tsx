@@ -21,9 +21,11 @@ export class CodeSuiteManager {
     public suites = new Map<string, ICodeSuite>();
 
     constructor() {
-        this.registerSuite('add_tests.elf', 'Test Suite');
         this.registerSuite('blinky.elf', 'Blinky');
         this.registerSuite('blinky2.elf', 'Blinky 2');
+        this.registerSuite('add_tests.elf', 'Test Suite');
+        this.registerSuite('imm_validation.elf', 'Imm Tests');
+        this.registerSuite('riscv_basic.elf', 'Riscv Basic');
     }
 
     public registerSuite(fileName: string, title: string) {
@@ -46,6 +48,11 @@ export class CodeSuiteManager {
     }
 
     private async loadSuite(suite: ICodeSuite) {
+        // Static assets are only available in the browser; skip during SSG/prerender.
+        if (typeof window === 'undefined') {
+            return;
+        }
+
         let basePath = (process.env.BASE_URL ?? '') + '/riscv/examples/';
         let resp = await fetch(basePath + suite.fileName);
 

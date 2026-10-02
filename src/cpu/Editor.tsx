@@ -1,10 +1,12 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { assignImm, isNotNil, StateSetter } from '../utils/data';
-import { IComp, IEditContext, IEditSchematic, IEditSnapshot, IEditorState, IExeSystem, ISchematic } from './CpuModel';
+import { IComp, IEditContext, IEditSchematic, IEditSnapshot, IEditorState, IExeSystem, ISchematic, IWireLabel } from './CpuModel';
 import { updateWiresForComp } from './Wire';
 import { AffineMat2d } from '../utils/AffineMat2d';
-import { Subscriptions } from '../utils/hooks';
+import { Subscriptions, useSubscriptions } from '../utils/hooks';
 import { getCompSubSchematicForPrefix } from './SubSchematics';
+import { arrayMax } from '../utils/array';
+import { Vec3 } from '../utils/vector';
 
 export enum PortHandling {
     Detach, // e.g. for rotating a component, the wire will need to be manually re-attached
@@ -55,28 +57,32 @@ export function editComp<A>(editCtx: IEditContext, end: boolean, comp: IComp<A>,
     });
 }
 
-export function editSubSchematic(editCtx: IEditContext, end: boolean, updateEditSchematic: (schematic: IEditSchematic, state: IEditorState, snapshot: IEditSnapshot) => IEditSchematic) {
-    return (state: IEditorState) => {
+export function editWireLabel(editCtx: IEditContext, end: boolean, labelId: string, updateWireLabel: (wireLabel: IWireLabel) => IWireLabel) {
+    return editSubSchematic(editCtx, end, (schematic, state) => {
 
-        let newSnapshot = updateSubSchematic(state, editCtx, state.snapshot, (schematic) => updateEditSchematic(schematic, state, state.snapshot));
-
-        if (end) {
-            if (newSnapshot === state.snapshot) {
-                return assignImm(state, { snapshotTemp: null });
-            }
-
-            state = assignImm(state, {
-                snapshot: newSnapshot,
-                snapshotTemp: null,
-                undoStack: [...state.undoStack, state.snapshot],
-                redoStack: [],
-            });
-        } else {
-            state = assignImm(state, { snapshotTemp: newSnapshot });
+        let comp2 = schematic.wireLabels.find(a => a.id === labelId)
+        if (!comp2) {
+            console.log('unable to edit labelId!!');
+            return schematic;
         }
 
-        return state;
-    };
+        let comp3 = updateWireLabel(comp2);
+        if (comp3 === comp2) {
+            return schematic;
+        }
+
+        schematic = assignImm(schematic, { wireLabels: schematic.wireLabels.map(a => a.id === labelId ? comp3! : a) });
+
+        return schematic;
+    });
+}
+
+export function editMainSchematic(end: boolean, updateEditSchematic: (schematic: IEditSchematic, state: IEditorState, snapshot: IEditSnapshot) => IEditSchematic) {
+    return editSubSchematic({ idPrefix: '' }, end, updateEditSchematic);
+}
+
+export function editSubSchematic(editCtx: IEditContext, end: boolean, updateEditSchematic: (schematic: IEditSchematic, state: IEditorState, snapshot: IEditSnapshot) => IEditSchematic) {
+    return editSnapshot(end, (snapshot, state) => updateSubSchematic(state, editCtx, snapshot, (schematic) => updateEditSchematic(schematic, state, snapshot)));
 }
 
 export function updateSubSchematic(editorState: IEditorState, editCtx: IEditContext, snapshot: IEditSnapshot, updateEditSchematic: (schematic: IEditSchematic) => IEditSchematic): IEditSnapshot {
@@ -98,11 +104,7 @@ export function updateSubSchematic(editorState: IEditorState, editCtx: IEditCont
     return snapshot;
 }
 
-export function editMainSchematic(end: boolean, updateEditSchematic: (schematic: IEditSchematic, state: IEditorState, snapshot: IEditSnapshot) => IEditSchematic) {
-    return editSubSchematic({ idPrefix: '' }, end, updateEditSchematic);
-}
-
-export function editSnapshot(end: boolean, updateSnapshot: (element: IEditSnapshot, state: IEditorState) => IEditSnapshot) {
+export function editSnapshot(end: boolean, updateSnapshot: (snapshot: IEditSnapshot, state: IEditorState) => IEditSnapshot) {
     return (state: IEditorState) => {
         let newSnapshot = updateSnapshot(state.snapshot, state);
 
@@ -137,8 +139,9 @@ export function ensureEditSchematic(schematic: ISchematic | IEditSchematic): IEd
         return schematic;
     }
     return assignImm(schematic as IEditSchematic, {
-        nextCompId: schematic.comps.reduce((max, c) => Math.max(max, parseInt(c.id)), 0) + 1,
-        nextWireId: schematic.wires.reduce((max, c) => Math.max(max, parseInt(c.id)), 0) + 1,
+        nextCompId: arrayMax(schematic.comps, c => parseInt(c.id), 0) + 1,
+        nextWireId: arrayMax(schematic.wires, c => parseInt(c.id), 0) + 1,
+        nextWireLabelId: arrayMax(schematic.wires, c => parseInt(c.id), 0) + 1,
     });
 }
 
@@ -171,21 +174,22 @@ export function redoAction(state: IEditorState) {
     });
 }
 
-export const EditorContext = createContext<IEditorContext | null>(null);
+export function notifyExeModelUpdated(state: IEditorState) {
+    return assignImm(state, { exeModelUpdateCntr: state.exeModelUpdateCntr + 1 });
+}
 
 export interface IEditorContext {
     editorState: IEditorState;
-    exeModel: IExeSystem;
     setEditorState: StateSetter<IEditorState>;
 }
 
-export function useEditorContext() {
-    const ctx = useContext(EditorContext);
-    if (!ctx) {
-        throw new Error('EditorContext not found');
-    }
-    return ctx;
+export function useCreateStoreState<T>(initial: () => T): [T, StateSetter<T>, MyStore<T>] {
+    let [store] = useState(() => new MyStore<T>(initial()));
+    useSubscriptions(store.subs);
+
+    return [store.value, store.setValue, store];
 }
+
 
 export interface IViewLayoutContext {
     el: HTMLElement;
@@ -202,20 +206,34 @@ export class MyStore<T> {
     subs: Subscriptions = new Subscriptions();
     constructor(public value: T) {
     }
-    setValue(value: T) {
-        this.value = value;
-        this.subs.notify();
+    setValue = (value: T | ((a : T) => T)) => {
+        let prevValue = this.value;
+        this.value = value instanceof Function ? value(this.value) : value;
+
+        compareValues(prevValue, this.value);
+
+        if (this.value !== prevValue) {
+            this.subs.notify();
+        }
     }
 }
 
-export const MyStoreContext = createContext<MyStore<IEditorState>>(new MyStore<IEditorState>(null!));
+function compareValues(a: any, b: any) {
+    if (a === b) {
+        return;
+    }
+
+    if ((!a.dragCreateComp) !== (!b.dragCreateComp)) {
+        console.log('dragCreateComp changed:', a.dragCreateComp, b.dragCreateComp);
+    }
+}
 
 type ObjPartial<T> = {
     [P in keyof T]?: T[P] | ObjPartial<T[P]>;
 };
 
 type ObjSubSplit<T> = {
-    [P in keyof T]?: ObjPartial<T[P]> | true;
+    [P in keyof T]?: ObjSubSplit<T[P]> | true;
 };
 
 function makeProxyObject<T extends Record<string, any>>(val: T, usages: ObjPartial<T>, subSplits: ObjSubSplit<T> | true): T {
@@ -232,7 +250,7 @@ function makeProxyObject<T extends Record<string, any>>(val: T, usages: ObjParti
                         subUsage = usages[key] = {};
                     }
 
-                    return makeProxyObject(target[key], subSplit, subUsage as ObjPartial<any>);
+                    return makeProxyObject(target[key], subUsage as ObjPartial<any>, subSplit);
                 }
             }
 
@@ -247,33 +265,48 @@ function makeProxyObject<T extends Record<string, any>>(val: T, usages: ObjParti
 }
 
 function areEqual<T extends Record<string, any>>(obj: T, usages: ObjPartial<T>, subSplits: ObjSubSplit<T> | true): boolean {
-    if (subSplits !== true) {
-        for (let prop of Object.keys(usages)) {
-            let key = prop as keyof T;
+    for (let prop of Object.keys(usages)) {
+        let key = prop as keyof T;
+
+        let deepField = false;
+        if (subSplits !== true) {
             let subSplit = subSplits[key];
 
             if (subSplit) {
                 if (!areEqual(obj[key], usages[key]!, subSplit)) {
                     return false;
                 }
-            } else if (obj[key] !== usages[key]) {
-                return false;
+                deepField = true;
             }
+        }
+
+        if (!deepField && obj[key] !== usages[key]) {
+            return false;
         }
     }
     return true;
 }
 
-export function useHighPerfEditorContext() {
+export const MyStoreContext = createContext<MyStore<IEditorState>>(new MyStore<IEditorState>(null!));
+
+// Items with sub-objects or true values will be proxied, and each of their sub-fields will be watched independently
+const editorCtxSubSplits: ObjSubSplit<IEditorState> = {
+    snapshot: {
+        mainSchematic: true,
+    },
+};
+
+export function useEditorContext(subSplitOverride?: ObjSubSplit<IEditorState> | true): readonly [IEditorState, StateSetter<IEditorState>, MyStore<IEditorState>] {
     let storeCtx = useContext(MyStoreContext);
     let visitedItemsRef = useRef<ObjPartial<IEditorState>>({});
     let [srcValue, setSrcValue] = useState(storeCtx.value);
 
-    let subSplits = useMemo<ObjSubSplit<IEditorState>>(() => ({ }), []);
+    let subSplits = subSplitOverride ?? editorCtxSubSplits;
 
     useEffect(() => {
         function updateFn() {
-            if (!areEqual(storeCtx.value, visitedItemsRef.current, subSplits)) {
+            let isEq = areEqual(storeCtx.value, visitedItemsRef.current, subSplits);
+            if (!isEq) {
                 setSrcValue(storeCtx.value);
             }
         }
@@ -281,5 +314,24 @@ export function useHighPerfEditorContext() {
     }, [storeCtx, subSplits]);
 
     visitedItemsRef.current = {};
-    return makeProxyObject(srcValue, visitedItemsRef.current, subSplits);
+    let proxyObj = makeProxyObject(srcValue, visitedItemsRef.current, subSplits);
+
+    return [proxyObj, storeCtx.setValue, storeCtx] as const;
+}
+
+export function canvasEvToModel(canvas: HTMLElement, ev: { clientX: number, clientY: number }, mtx: AffineMat2d) {
+    return mtx.mulVec3Inv(canvasEvToScreen(canvas, ev));
+}
+
+export function canvasEvToScreen(canvas: HTMLElement, ev: { clientX: number, clientY: number }) {
+    let bcr = canvas.getBoundingClientRect();
+    return new Vec3(ev.clientX - (bcr?.x ?? 0), ev.clientY - (bcr?.y ?? 0));
+}
+
+export function modelToScreen(pt: Vec3, mtx: AffineMat2d) {
+    return mtx.mulVec3(pt);
+}
+
+export function screenToModel(pt: Vec3, mtx: AffineMat2d) {
+    return mtx.mulVec3Inv(pt);
 }

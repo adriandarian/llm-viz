@@ -1,7 +1,9 @@
 import { AffineMat2d } from "../utils/AffineMat2d";
+import { hasFlag } from "../utils/data";
 import { BoundingBox3d, Vec3 } from "../utils/vector";
-import { IEditSnapshot, IEditorState } from "./CpuModel";
-import { compPortDefId } from "./comps/CompPort";
+import { IComp, IEditSnapshot, IEditorState } from "./CpuModel";
+import { WireRenderCache } from "./render/WireRenderCache";
+import { CompPortFlags, ICompPortConfig, compPortDefId } from "./comps/CompPort";
 import { ISharedContext, createSharedContext } from "./library/SharedContext";
 
 export interface IBoundingBoxOptions {
@@ -16,8 +18,7 @@ export function computeModelBoundingBox(model: IEditSnapshot, options?: IBoundin
             continue;
         }
 
-        modelBbb.addInPlace(c.pos);
-        modelBbb.addInPlace(c.pos.add(c.size));
+        modelBbb.combineInPlace(c.bb);
     }
     for (let w of model.mainSchematic.wires) {
         for (let n of w.nodes) {
@@ -31,17 +32,20 @@ export function computeModelBoundingBox(model: IEditSnapshot, options?: IBoundin
     return modelBbb;
 }
 
-export function computeZoomExtentMatrix(modelBb: BoundingBox3d, viewBb: BoundingBox3d, expandFraction: number): AffineMat2d {
-    let bb = new BoundingBox3d(modelBb.min, modelBb.max);
-    bb.expandInPlace(modelBb.size().mul(expandFraction).len());
+export function computeZoomExtentMatrix(modelBb: BoundingBox3d, viewBb: BoundingBox3d, expandFraction: number, boundaryPx: number): AffineMat2d {
+    modelBb = modelBb.clone();
+    modelBb.expandInPlace(modelBb.size().mul(expandFraction).len());
 
-    let modelSize = bb.size();
+    viewBb = viewBb.clone();
+    viewBb.shrinkInPlaceXY(boundaryPx);
+
+    let modelSize = modelBb.size();
     let viewSize = viewBb.size();
 
     let mtx = AffineMat2d.multiply(
         AffineMat2d.translateVec(viewBb.center()),
         AffineMat2d.scale1(Math.min(viewSize.x / modelSize.x, viewSize.y / modelSize.y)),
-        AffineMat2d.translateVec(bb.center().mul(-1)),
+        AffineMat2d.translateVec(modelBb.center().mul(-1)),
     );
 
     return mtx;
@@ -59,6 +63,9 @@ export function createCpuEditorState(sharedContext: ISharedContext | null): IEdi
         compLibrary: sharedContext.compLibrary,
         schematicLibrary: sharedContext.schematicLibrary,
         codeLibrary: sharedContext.codeLibrary,
+        wireRenderCache: new WireRenderCache(),
+        exeModel: null,
+        exeModelUpdateCntr: 1,
         desiredSchematicId: null,
         activeSchematicId: null,
         redoStack: [],
@@ -79,19 +86,35 @@ export function constructEditSnapshot(): IEditSnapshot {
     return {
         focusedIdPrefix: "",
         selected: [],
+        selectionRotateCenter: null,
         mainSchematic: {
             id: "",
             name: "",
 
             nextWireId: 0,
             nextCompId: 0,
+            nextWireLabelId: 0,
             wires: [],
             comps: [],
+            wireLabels: [],
 
             compPorts: [],
             compSize: new Vec3(0, 0),
             compBbox: new BoundingBox3d(),
+            innerDisplayBbox: undefined,
         },
         subSchematics: {},
     };
+}
+
+
+export function compIsVisible(comp: IComp, idPrefix: string) {
+    if (idPrefix && comp.defId === compPortDefId) {
+        let args = comp.args as ICompPortConfig;
+        if (hasFlag(args.flags, CompPortFlags.HiddenInParent)) {
+            return false;
+        }
+    }
+
+    return true;
 }

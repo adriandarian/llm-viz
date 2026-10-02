@@ -1,6 +1,6 @@
-import { isNil, hasFlag, assignImm } from "@/src/utils/data";
+import { isNil, hasFlag, StateSetter } from "@/src/utils/data";
 import { BoundingBox3d, Vec3 } from "@/src/utils/vector";
-import { PortType, IComp, ICompPort, ICompRenderArgs, IExeComp, IExePhase, IExePort, IExeRunArgs, IoDir, IEditSnapshot, ILibraryItem, ISchematic } from "../CpuModel";
+import { PortType, IComp, ICompPort, ICompRenderArgs, IExeComp, IExePhase, IExePort, IExeRunArgs, IoDir, ISchematic, ISubLayoutPort, ICompOptsRenderArgs, CompDefFlags, IEditorState } from "../CpuModel";
 
 export interface ICompBuilderArgs {
 
@@ -54,12 +54,13 @@ Editing is either: editing directly, or within the scope of a tree of components
 
 */
 
-export interface ICompDef<T, A = any> {
+export interface ICompDef<T, A extends IBaseCompConfig = any> {
     defId: string;
     altDefIds?: string[]; // so we can safely rename things
     name: string;
     size: Vec3;
     type?: CompDefType; // defaults to BuiltIn
+    flags?: CompDefFlags | ((args: A, compDef: ICompDef<T, A>) => CompDefFlags);
     ports: ICompPort[] | ((args: A, compDef: ICompDef<T, A>) => ICompPort[]);
     subLayout?: ISubLayoutArgs;
 
@@ -80,17 +81,34 @@ export interface ICompDef<T, A = any> {
     // Let render() handle all rendering; don't render a box/name
     renderAll?: boolean;
 
+    renderCanvasPath?: (args: ICompRenderArgs<T, A>) => void;
+
+    renderOptions?: (args: ICompOptsRenderArgs<T, A>) => React.ReactNode;
+
     // copy things like memory & registers (not ports) between IExeComp data's (during a regen of the exe model)
     copyStatefulData?: (src: T, dest: T) => void;
+
+    updateSubSchematicCompArgs?: (args: ICompSubSchematicArgs<A>) => ISchematic;
 
     // action to reset stateful components, typically to 0x00. Option for hard or soft reset. Soft reset is typically
     // equivalent to a power-down/restart (leaving ROM untouched), while a hard reset includes things like ROMs.
     reset?: (exeComp: IExeComp<T>, resetOpts: IResetOptions) => void;
 }
 
+export interface IBaseCompConfig {
+    name?: string;
+    extId?: string;
+}
+
 export enum CompDefType {
     Builtin,
     UserDefined,
+}
+
+export interface ICompSubSchematicArgs<A> {
+    comp: IComp<A>;
+    schematic: ISchematic;
+    issues: string[];
 }
 
 export interface ISubLayoutArgs {
@@ -109,114 +127,6 @@ export interface ISubLayoutArgs {
     ports: ISubLayoutPort[];
 }
 
-export interface ISubLayoutPort {
-    id: string;
-    name: string
-    type: PortType;
-    pos: Vec3;
-    width?: number;
-}
-
-export class CompLibrary {
-    libraryLookup = new Map<string, ILibraryItem>();
-    constructor() {}
-
-    public addComp(comp: ICompDef<any>) {
-        let item = createLibraryItemFromComp(comp);
-        this.addLibraryItem(item);
-    }
-
-    public addLibraryItem(item: ILibraryItem) {
-        this.libraryLookup.set(item.id, item);
-        for (let altId of item.altIds ?? []) {
-            this.libraryLookup.set(altId, item);
-        }
-    }
-
-    getCompDef(defId: string): ICompDef<any> | null {
-        let item = this.libraryLookup.get(defId);
-        if (!item || !item.compDef) {
-            return null;
-        }
-        return item.compDef;
-    }
-
-    create<A = undefined>(defId: string, cfg?: A | undefined): IComp<A> {
-        let compDef = this.getCompDef(defId);
-        if (!compDef) {
-            return {
-                id: '',
-                defId,
-                name: '<unknown>',
-                args: cfg!,
-                ports: [],
-                pos: new Vec3(0, 0),
-                size: new Vec3(4, 4),
-                resolved: false,
-                hasSubSchematic: false,
-            };
-        }
-
-        let args = compDef.initConfig ? compDef.initConfig({}) : null;
-
-        if (args && cfg) {
-            args = assignImm(args, cfg);
-        }
-
-        let comp: IComp = {
-            id: '',
-            defId: compDef.defId,
-            name: compDef.name,
-            ports: compDef.ports instanceof Function ? compDef.ports(args, compDef) : compDef.ports,
-            pos: new Vec3(0, 0),
-            size: compDef.size,
-            args,
-            resolved: true,
-            hasSubSchematic: !!compDef.subLayout,
-        };
-        compDef.applyConfig?.(comp, comp.args);
-
-        return comp;
-    }
-
-    updateCompFromDef(comp: IComp) {
-        let compDef = this.getCompDef(comp.defId);
-        if (!compDef) {
-            return;
-        }
-        comp.name ??= compDef.name;
-        comp.ports = compDef.ports instanceof Function ? compDef.ports(comp.args, compDef) : compDef.ports;
-        comp.size = compDef.size;
-        comp.hasSubSchematic = !!compDef.subLayout;
-        compDef.applyConfig?.(comp, comp.args);
-    }
-
-    updateAllCompsFromDefs(comps: IComp[]) {
-        for (let comp of comps) {
-            this.updateCompFromDef(comp);
-        }
-        return comps;
-    }
-
-    build(comp: IComp): IExeComp<any> {
-        let compDef = this.getCompDef(comp.defId);
-        if (compDef?.build) {
-            let builder = new ExeCompBuilder<any>(comp);
-            return compDef.build(builder);
-        }
-        return buildDefault(comp);
-    }
-}
-
-export function createLibraryItemFromComp(compDef: ICompDef<any>): ILibraryItem {
-    return {
-        id: compDef.defId,
-        altIds: compDef.altDefIds,
-        name: compDef.name,
-        compDef: compDef,
-    };
-}
-
 export class ExeCompBuilder<T, A=any> {
     ports: IExePort[] = [];
     portNameToIdx = new Map<string, number>();
@@ -228,16 +138,21 @@ export class ExeCompBuilder<T, A=any> {
     constructor(
         public comp: IComp<A>,
     ) {
-        this.ports = comp.ports.map<IExePort>((node, i) => {
+        this.ports = comp.ports.map<IExePort>((port, i) => {
             return {
                 portIdx: i,
                 netIdx: -1,
                 ioEnabled: true,
                 ioDir: IoDir.None,
                 dataUsed: true,
-                type: node.type ?? PortType.In,
+                type: port.type ?? PortType.In,
                 value: 0,
-                width: node.width ?? 1,
+                floating: false,
+                hasFloatingValue: false,
+                width: port.width ?? 1,
+                resolved: false,
+                waitingBlockIdx: -1,
+                waitingCounterIdx: -1,
             };
         });
 
@@ -265,8 +180,13 @@ export class ExeCompBuilder<T, A=any> {
             ioEnabled: true,
             ioDir: IoDir.None,
             type: type,
+            floating: false,
+            hasFloatingValue: false,
             value: 0,
             width: width,
+            resolved: false,
+            waitingBlockIdx: -1,
+            waitingCounterIdx: -1,
         };
         this.ports.push(newPort);
         return newPort;
@@ -278,19 +198,25 @@ export class ExeCompBuilder<T, A=any> {
     }
 
     public addLatchedPhase(func: (comp: IExeComp<T>, args: IExeRunArgs) => void, inPorts: IExePort[], outPorts: IExePort[]): ExeCompBuilder<T> {
-        return this.addPhase(func, inPorts, outPorts, true);
+        return this.addPhase(func, inPorts, outPorts, { isLatch: true });
     }
 
-    public addPhase(func: (comp: IExeComp<T>, args: IExeRunArgs) => void, inPorts: IExePort[], outPorts: IExePort[], isLatch: boolean = false): ExeCompBuilder<T> {
+    public addPhase(func: (comp: IExeComp<T>, args: IExeRunArgs) => void, inPorts: IExePort[], outPorts: IExePort[], args?: IPhaseArgs): ExeCompBuilder<T> {
         if (this.seenLatch) {
             throw new Error(`Cannot add phase after latch phase`);
         }
+
+        let isLatch = args?.isLatch ?? false;
+
         if (isLatch) {
             this.seenLatch = true;
         }
         this.phases.push({
             readPortIdxs: inPorts.map(a => a.portIdx),
             writePortIdxs: outPorts.map(a => a.portIdx),
+            requiresOnePortIdxs: args?.atLeastOneResolved?.map(a => a.portIdx) ?? null,
+            exeBlockIdx: -1,
+            portsHaveDecrBlockTargets: false,
             func,
             isLatch,
         });
@@ -309,6 +235,10 @@ export class ExeCompBuilder<T, A=any> {
     }
 }
 
+interface IPhaseArgs {
+    isLatch?: boolean;
+    atLeastOneResolved?: IExePort[];
+}
 
 export function buildDefault(comp: IComp): IExeComp<{}> {
     let builder = new ExeCompBuilder<{}>(comp);

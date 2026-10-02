@@ -1,9 +1,102 @@
-import { assignImm, getOrAddToMap, isNil } from "../utils/data";
+import { assignImm, getOrAddToMap, hasFlag, isNil } from "../utils/data";
 import { projectOntoVector, segmentNearestPoint, segmentNearestT, Vec3 } from "../utils/vector";
-import { IWire, ISegment, IWireGraph, IWireGraphNode, IElRef, RefType, IComp, IEditSchematic } from "./CpuModel";
+import { IWireGraph, IWireGraphNode, IElRef, RefType, IComp, IEditSchematic, PortType, IEditorState } from "./CpuModel";
 import { PortHandling } from "./Editor";
+import { rotateCompPortPos } from "./comps/CompHelpers";
 
-export function moveSelectedComponents(schematic: IEditSchematic, selected: IElRef[], delta: Vec3): IEditSchematic {
+export function adjustWiresToPorts(schematic: IEditSchematic, compRefs: IElRef[]): IEditSchematic {
+    let compPorts = new Map<string, { pos: Vec3, ref: IElRef }>();
+
+    let selection = new Set(compRefs.map(refToString));
+    let wiresAndNodesToMove = new Map<string, Map<number, Vec3>>();
+
+    // Create a map of all the comp ports
+    for (let comp of schematic.comps) {
+        if (!selection.has(refToString({ type: RefType.Comp, id: comp.id }))) {
+            continue;
+        }
+        for (let port of comp.ports ?? []) {
+            let pos = rotateCompPortPos(comp, port);
+            let ref: IElRef = { type: RefType.CompNode, id: comp.id, compNodeId: port.id };
+            compPorts.set(refToString(ref), { pos, ref });
+        }
+    }
+
+    // Find any wires that are bound to a selected comp port
+    // And check whether the wire node is in the same spot as the port
+    // If not, move the wire node to the port
+    for (let wire of schematic.wires) {
+        let nodeIdsToMove = new Map<number, Vec3>();
+
+        for (let node of wire.nodes) {
+            if (node.ref) {
+                let refStr = refToString(node.ref);
+                let compPortInfo = compPorts.get(refStr);
+                if (compPortInfo) {
+                    if (compPortInfo.pos.dist(node.pos) > EPSILON) {
+                        nodeIdsToMove.set(node.id, compPortInfo.pos.sub(node.pos));
+                    }
+                }
+            }
+        }
+
+        wiresAndNodesToMove.set(wire.id, nodeIdsToMove);
+    }
+
+    return assignImm(schematic, {
+        wires: schematic.wires.map(wire => {
+            let nodeIdsToMove = wiresAndNodesToMove.get(wire.id);
+            if (nodeIdsToMove) {
+                wire = dragNodes(wire, nodeIdsToMove);
+            }
+            return wire;
+        }),
+    });
+
+}
+
+
+export function rebindWiresToPorts(schematic: IEditSchematic, compRefs: IElRef[]): IEditSchematic {
+    let compPortLocs = new Map<string, { pos: Vec3, ref: IElRef }>();
+
+    let selection = new Set(compRefs.map(refToString));
+
+    // Create a map of all the comp ports
+    for (let comp of schematic.comps) {
+        if (!selection.has(refToString({ type: RefType.Comp, id: comp.id }))) {
+            continue;
+        }
+        for (let port of comp.ports ?? []) {
+            if (!hasFlag(port.type, PortType.Hidden)) {
+                let pos = rotateCompPortPos(comp, port);
+                let ref: IElRef = { type: RefType.CompNode, id: comp.id, compNodeId: port.id };
+                compPortLocs.set(vecToPosStr(pos), { pos, ref });
+            }
+        }
+    }
+
+    // Find any wires that are touching a comp port on a selected comp
+    return assignImm(schematic, {
+        wires: schematic.wires.map(wire => {
+
+            wire.nodes = wire.nodes.map(node => {
+                let ref = node.ref;
+                let posStr = vecToPosStr(node.pos);
+                if (ref?.type === RefType.CompNode && selection.has(refToString({ type: RefType.Comp, id: ref.id }))) {
+                    ref = undefined;
+                }
+                if (compPortLocs.has(posStr)) {
+                    ref = compPortLocs.get(posStr)!.ref;
+                }
+                return assignImm(node, { ref });
+            });
+            return wire;
+        }),
+    });
+
+}
+
+export function moveSelectedComponents(editorState: IEditorState, schematic: IEditSchematic, selected: IElRef[], delta: Vec3): IEditSchematic {
     if (delta.dist(Vec3.zero) < EPSILON) {
         return schematic;
     }
@@ -27,7 +120,7 @@ export function moveSelectedComponents(schematic: IEditSchematic, selected: IElR
             continue;
         }
         for (let port of comp.ports ?? []) {
-            let pos = comp.pos.add(port.pos);
+            let pos = rotateCompPortPos(comp, port);
             let ref: IElRef = { type: RefType.CompNode, id: comp.id, compNodeId: port.id };
             compPorts.set(refToString(ref), { pos, ref });
         }
@@ -80,7 +173,8 @@ export function moveSelectedComponents(schematic: IEditSchematic, selected: IElR
     return assignImm(schematic, {
         comps: schematic.comps.map(comp => {
             if (compsToMove.has(comp.id)) {
-                return assignImm(comp, { pos: snapToGrid(comp.pos.add(delta)) });
+                comp = assignImm(comp, { pos: snapToGrid(comp.pos.add(delta)) });
+                editorState.compLibrary.updateCompFromDef(comp);
             }
             return comp;
         }),
@@ -117,7 +211,7 @@ export function updateWiresForComp<T extends IEditSchematic>(layout: T, comp: IC
                         nodeIdsToClean.add(node.id);
                         continue;
                     }
-                    let delta = comp.pos.add(port.pos).sub(node.pos);
+                    let delta = rotateCompPortPos(comp, port).sub(node.pos);
 
                     nodeIdsToMove.set(node.id, delta);
                 }
@@ -151,7 +245,21 @@ export function refToString(ref: IElRef): string {
             return `WN|${ref.id}|${ref.wireNode0Id!}`;
         case RefType.WireSeg:
             return `W|${ref.id}|${ref.wireNode0Id!}|${ref.wireNode1Id!}`;
+        default:
+            return '';
     }
+}
+
+export function refStringForComp(comp: IComp) {
+    return `C|${comp.id}`;
+}
+
+export function refStringForWireNode(wire: IWireGraph, nodeIdx: number) {
+    return `WN|${wire.id}|${nodeIdx}`;
+}
+
+export function refStringForWireSeg(wire: IWireGraph, node0Idx: number, node1Idx: number) {
+    return `W|${wire.id}|${node0Idx}|${node1Idx}`;
 }
 
 export function parseRefStr(str: string): IElRef {
@@ -181,6 +289,9 @@ export function dragNodes(wire: IWireGraph, nodesToMove: Map<number, Vec3>) {
     // if we're moving right, we start from the leftmost seg, and vice versa
     // we need to pick a dog-leg height, so choose the smallest one
     // then increase that height for subsequent segments
+
+    checkWires([wire], 'dragNodes (pre)');
+
     wire = copyWireGraph(wire);
 
     let initialNodes = new Set(nodesToMove.keys());
@@ -208,8 +319,10 @@ export function dragNodes(wire: IWireGraph, nodesToMove: Map<number, Vec3>) {
 
             // find all nodes colinear with this segment
             let anyPinnedNodes = false;
+            let allColinearIds: number[] = [];
             iterColinearNodes(wire, node1Idx, dir, node => {
                 let moveAmt = nodesToMove.get(node.id);
+                allColinearIds.push(node.id);
 
                 if (isPinnedNode(node.id)) {
                     anyPinnedNodes = true;
@@ -235,6 +348,7 @@ export function dragNodes(wire: IWireGraph, nodesToMove: Map<number, Vec3>) {
                     wireUnlinkNodes(node0, node1);
                     wireLinkNodes(node0, newNode);
                     wireLinkNodes(newNode, node1);
+                    // addNewNodeToWire(wire, newNode);
                     wire.nodes.push(newNode);
                 }
             }
@@ -247,7 +361,50 @@ export function dragNodes(wire: IWireGraph, nodesToMove: Map<number, Vec3>) {
          });
     }
 
+    wire = fixWire(wire);
+
+    checkWires([wire], 'dragNodes (post)');
+
     return wire;
+}
+
+function addNewNodeToWire(wire: IWireGraph, newNode: IWireGraphNode) {
+    // detect duplicates
+    let nodeLocs = new Map<string, IWireGraphNode[]>();
+    for (let node of wire.nodes) {
+        getOrAddToMap(nodeLocs, `${node.pos.x},${node.pos.y}`, () => []).push(node);
+    }
+
+    let newNodeKey = `${newNode.pos.x},${newNode.pos.y}`;
+
+    let existing = nodeLocs.get(newNodeKey);
+    if (existing) {
+        let firstNode = existing[0];
+
+        for (let node1Idx of [...newNode.edges]) {
+            wireUnlinkNodes(newNode, wire.nodes[node1Idx]);
+            wireLinkNodes(firstNode, wire.nodes[node1Idx]);
+        }
+    } else {
+        wire.nodes.push(newNode);
+    }
+
+
+    // Clean up any duplicate nodes
+    // for (let sharedNodes of nodeLocs.values()) {
+    //     if (sharedNodes.length > 1) {
+    //         let allOutEdges = new Set(sharedNodes.flatMap(n => n.edges));
+    //         for (let node0 of sharedNodes) {
+    //             for (let node1Idx of node0.edges) {
+    //                 wireUnlinkNodes(node0, wire.nodes[node1Idx]);
+    //             }
+    //             allOutEdges.delete(node0.id);
+    //         }
+    //         for (let outNode of allOutEdges) {
+    //             wireLinkNodes(newNode, wire.nodes[outNode]);
+    //         }
+    //     }
+    // }
 }
 
 export function iterColinearNodes(wire: IWireGraph, nodeIdx: number, dir: Vec3, cb: (node: IWireGraphNode) => void) {
@@ -354,6 +511,18 @@ export function checkWires(wires: IWireGraph[], name: string) {
                 console.log(`CHECK [${name}]: Wire ${wire.id} has unidirectional edge ${node0.id} -> ${node1.id}`);
             }
         }
+
+        // let nodeLocs = new Map<string, IWireGraphNode[]>();
+        // for (let node0 of wire.nodes) {
+        //     getOrAddToMap(nodeLocs, `${node0.pos.x},${node0.pos.y}`, () => []).push(node0);
+        // }
+
+        // for (let [key, arr] of nodeLocs.entries()) {
+        //     if (arr.length > 1) {
+        //         console.log(`CHECK [${name}]: Wire ${wire.id} has multiple nodes at ${key}: ${arr.map(a => a.id).join(', ')}`);
+        //     }
+        // }
+
     }
 }
 
@@ -362,18 +531,22 @@ export function copyWireGraph(wire: IWireGraph): IWireGraph {
     return { ...wire, nodes };
 }
 
-function createNodePosMap(layout: IEditSchematic) {
+function vecToPosStr(v: Vec3) {
+    return `${v.x},${v.y}`;
+}
+
+function createPortPosMap(layout: IEditSchematic) {
     let nodePosMap = new Map<string, { pos: Vec3, ref: IElRef }>();
     for (let comp of layout.comps) {
-        for (let node of comp.ports) {
-            let nodePos = comp.pos.add(node.pos);
+        for (let port of comp.ports) {
+            let portPos = rotateCompPortPos(comp, port);
             let ref: IElRef = {
                 type: RefType.CompNode,
                 id: comp.id,
-                compNodeId: node.id,
+                compNodeId: port.id,
             };
-            let posStr = `${nodePos.x},${nodePos.y}`;
-            nodePosMap.set(posStr, { pos: nodePos, ref });
+            let posStr = `${portPos.x},${portPos.y}`;
+            nodePosMap.set(posStr, { pos: portPos, ref });
         }
     }
 
@@ -458,7 +631,7 @@ export function fixWires(layout: IEditSchematic, wires: IWireGraph[], editIdx: n
 
     let editWireGraph = wires[editIdx];
 
-    let nodePosMap = createNodePosMap(layout);
+    let nodePosMap = createPortPosMap(layout);
     for (let node of editWireGraph.nodes) {
         let posStr = `${node.pos.x},${node.pos.y}`;
         let nodePos = nodePosMap.get(posStr);
@@ -542,7 +715,19 @@ export function repackGraphIds(wire: IWireGraph): IWireGraph {
     return assignImm(wire, { nodes: newNodes });
 }
 
-export function wireToGraph(wire: IWire): IWireGraph {
+export interface IWireSegs {
+    id: string;
+    segments: ISegment[];
+}
+
+export interface ISegment {
+    p0: Vec3;
+    p1: Vec3;
+    comp0Ref?: IElRef;
+    comp1Ref?: IElRef;
+}
+
+export function wireToGraph(wire: IWireSegs): IWireGraph {
     let isects = new Map<string, IWireGraphNode>();
 
     function getNode(pos: Vec3, ref?: IElRef) {
@@ -594,7 +779,7 @@ export function wireToGraph(wire: IWire): IWireGraph {
     };
 }
 
-export function graphToWire(graph: IWireGraph): IWire {
+export function graphToWire(graph: IWireGraph): IWireSegs {
 
     let segments: ISegment[] = [];
 
@@ -706,7 +891,22 @@ export function fixWire(wireGraph: IWireGraph) {
     return graph;
 }
 
+export function fixWireGraph(wireGraph: IWireGraph) {
+    // things to fix:
+    //  - duplicate nodes
+    //  - dangling edges
+    //  - unused/empty nodes
+    //  - nodes-on-edges (should split the edge)
+
+    // colinearity ?? not neccesarily
+
+}
+
 export function wireLinkNodes(node0: IWireGraphNode, node1: IWireGraphNode) {
+    if (node0.id === node1.id) {
+        return;
+    }
+
     if (!node0.edges.includes(node1.id)) {
         node0.edges.push(node1.id);
     }

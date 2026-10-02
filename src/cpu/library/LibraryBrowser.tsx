@@ -6,9 +6,8 @@ import { faPencil, faPlus, faTimes, IconDefinition } from "@fortawesome/free-sol
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import clsx from "clsx";
 import React, { ButtonHTMLAttributes, useLayoutEffect, useMemo, useState } from "react";
-import { ILibraryItem } from "../CpuModel";
+import { ILibraryItem, ISchematicDef } from "../CpuModel";
 import { useEditorContext } from "../Editor";
-import { ISchematicDef } from "../schematics/SchematicLibrary";
 import { pluralize } from "@/src/utils/text";
 import { Resizer } from "@/src/utils/Resizer";
 
@@ -152,7 +151,7 @@ function schematicToLibraryItem(schematic: ISchematicDef, isBuiltin: boolean): I
     return {
         id: schematic.id,
         name: schematic.name,
-        schematic: schematic.model.mainSchematic,
+        schematic: schematic.snapshot.mainSchematic,
         // ports: schematic?.compArgs?.ports.map(p => ({ ...p })) ?? [],
         // size: schematic?.compArgs?.size ?? new Vec3(0, 0),
         // type: CompDefType.UserDefined,
@@ -166,7 +165,7 @@ function schematicToLibraryItem(schematic: ISchematicDef, isBuiltin: boolean): I
 
 export const LibraryBrowser: React.FC<{}> = () => {
 
-    let { editorState, setEditorState } = useEditorContext();
+    let [editorState, setEditorState] = useEditorContext();
     let [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
     let [selectedItemId, setSelectedItemId] = useState<string | null>(null);
 
@@ -221,7 +220,7 @@ export const LibraryBrowser: React.FC<{}> = () => {
                     <FontAwesomeIcon icon={faTimes} className="px-3" />
                 </button>
             </div>
-            <Resizer id="libraryBrowser" className="flex-1 overflow-hidden border" defaultFraction={0.3}>
+            <Resizer id="libraryBrowser" className="flex-1 overflow-hidden border" defaultAmt={0.3}>
                 <div className="flex flex-col flex-1 overflow-hidden">
                     <h2 className="text-center p-1 border-b">Folders</h2>
                     <div className="flex flex-col overflow-y-auto flex-1">
@@ -248,7 +247,7 @@ export const LibraryBrowser: React.FC<{}> = () => {
                     </div>
                 </div>
 
-                <Resizer id="fileInfoSplit" vertical className="flex-1" defaultFraction={0.5}>
+                <Resizer id="fileInfoSplit" vertical className="flex-1" defaultAmt={0.5}>
                     <div className="flex-1 overflow-y-auto bg-gray-100 shadow-inner">
                         <div className="grid p-2"
                             style={{ gridTemplateColumns: 'repeat(auto-fit, 230px)' }}

@@ -1,22 +1,27 @@
 import React, { memo, useState } from 'react';
 import { Vec3 } from "@/src/utils/vector";
-import { IComp, IEditContext, IExeComp, IExePort, PortType } from "../CpuModel";
-import { ICompBuilderArgs, ICompDef } from "./CompBuilder";
+import { CompDefFlags, IComp, IEditContext, IExeComp, IExePort, PortType } from "../CpuModel";
+import { IBaseCompConfig, ICompBuilderArgs, ICompDef } from "./CompBuilder";
 import { editCompConfig, useEditorContext } from '../Editor';
 import { assignImm } from '@/src/utils/data';
-import { CompRectBase, CompRectUnscaled, makeEditFunction, CheckboxMenuTitle, ConfigMenu, MenuRow } from './RenderHelpers';
+import { CompRectBase, CompRectUnscaled, CheckboxMenuTitle, ConfigMenu, MenuRow } from './RenderHelpers';
 import s from './CompStyles.module.scss';
 import { HexValueEditor, HexValueInputType, clampToSignedWidth } from '../displayTools/HexValueEditor';
-import { FontType, makeCanvasFont } from '../CanvasRenderHelpers';
-import { PortPlacement, PortResizer, portPlacementToPos } from './CompPort';
+import { FontType, makeCanvasFont } from '../render/CanvasRenderHelpers';
+import { PortPlacement, portPlacementToPos } from './CompPort';
+import { EditKvp } from '../sidebars/CompDetails';
+import { BooleanEditor } from '../displayTools/BooleanEditor';
+import { ensureSigned32Bit, makeEditFunction } from './CompHelpers';
+import { PortResizer } from './CompResizing';
 
-interface IInputConfig {
+interface IInputConfig extends IBaseCompConfig {
     value: number;
     valueMode: HexValueInputType;
     bitWidth: number;
     w: number;
     h: number;
     portPos: PortPlacement;
+    rotate: number;
     signed: boolean;
 }
 
@@ -33,14 +38,35 @@ export function createInputOutputComps(_args: ICompBuilderArgs): ICompDef<any>[]
 
     let w = 6;
     let h = 4;
-    let output: ICompDef<ICompDataOutput> = {
+    let output: ICompDef<ICompDataOutput, IInputConfig> = {
         defId: 'io/output0',
         altDefIds: ['output0'],
         name: "Output",
         size: new Vec3(w, h),
-        ports: [
-            { id: 'x', name: 'x', pos: new Vec3(0, 2), type: PortType.In, width: 32 },
-        ],
+        flags: CompDefFlags.HasBitWidth | CompDefFlags.CanRotate | CompDefFlags.IsAtomic,
+        ports: (args, compDef) => {
+            let portType = PortType.In;
+            let pos = portPlacementToPos(0, args.w, args.h);
+
+            return [
+                { id: 'x', name: '', pos, type: portType, width: args.bitWidth },
+            ];
+        },
+        initConfig: () => ({
+            value: 4,
+            valueMode: HexValueInputType.Hex,
+            bitWidth: 32,
+            h: 4,
+            w: constW,
+            portPos: PortPlacement.Right,
+            rotate: 0,
+            signed: false,
+        }),
+        applyConfig: (comp, args) => {
+            // args.portPos ??= PortPlacement.Right;
+            // args.rotate ??= args.portPos;
+            comp.size = new Vec3(args.w, args.h);
+        },
         build: (builder) => {
             let data = builder.addData({
                 inPort: builder.getPort('x'),
@@ -62,9 +88,13 @@ export function createInputOutputComps(_args: ICompBuilderArgs): ICompDef<any>[]
             ctx.textBaseline = 'middle';
 
             let value = exeComp.data.inPort.value;
-            ctx.fillText(value.toString(), comp.pos.x + comp.size.x / 2, comp.pos.y + comp.size.y / 2);
+            let bb = comp.bb;
+            ctx.fillText(value.toString(), bb.center().x, bb.center().y + 0.1);
 
             ctx.restore();
+        },
+        renderDom: ({ comp, editCtx, isActive }) => {
+            return isActive && <PortResizer editCtx={editCtx} comp={comp} />;
         },
     };
 
@@ -75,9 +105,10 @@ export function createInputOutputComps(_args: ICompBuilderArgs): ICompDef<any>[]
         altDefIds: ['const32'],
         name: "Const32",
         size: new Vec3(constW, h),
+        flags: CompDefFlags.HasBitWidth | CompDefFlags.CanRotate | CompDefFlags.IsAtomic,
         ports: (args, compDef) => {
             let portType = PortType.Out;
-            let pos = portPlacementToPos(args.portPos, args.w, args.h);
+            let pos = portPlacementToPos(0, args.w, args.h);
 
             return [
                 { id: 'out', name: '', pos, type: portType, width: args.bitWidth },
@@ -90,9 +121,12 @@ export function createInputOutputComps(_args: ICompBuilderArgs): ICompDef<any>[]
             h: 4,
             w: constW,
             portPos: PortPlacement.Right,
+            rotate: 0,
             signed: false,
         }),
         applyConfig: (comp, args) => {
+            // args.portPos ??= PortPlacement.Right;
+            // args.rotate ??= args.portPos;
             comp.size = new Vec3(args.w, args.h);
         },
         build: (builder) => {
@@ -108,28 +142,67 @@ export function createInputOutputComps(_args: ICompBuilderArgs): ICompDef<any>[]
             return builder.build();
         },
         render: ({ comp, ctx, cvs, exeComp, styles }) => {
-            // ctx.textAlign = 'center';
-            // ctx.textBaseline = 'middle';
-            // ctx.font = `${styles.fontSize}px monospace`;
-            // ctx.fillStyle = 'black';
-            // ctx.fillText('' + ensureSigned32Bit(exeComp?.data.value ?? 0), comp.pos.x + comp.size.x / 2, comp.pos.y + comp.size.y * 0.5);
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.font = makeCanvasFont(styles.fontSize, FontType.Mono);
+            ctx.fillStyle = 'black';
+            let bb = comp.bb;
+            ctx.fillText('' + ensureSigned32Bit(exeComp?.data.value ?? 0), bb.center().x, bb.center().y + 0.1);
         },
-
-        renderDom: ({ comp, exeComp, styles, editCtx, isActive }) => {
-            return <InputEditor editCtx={editCtx} isActive={isActive} comp={comp} exeComp={exeComp} styles={styles} />;
+        renderOptions: ({ comp, exeComp, editCtx }) => {
+            return <InputOptions editCtx={editCtx} comp={comp} exeComp={exeComp} />;
+        },
+        renderDom: ({ comp, editCtx, isActive }) => {
+            return isActive && <PortResizer editCtx={editCtx} comp={comp} />;
         },
     };
 
     return [output, const32];
 }
 
-export const InputEditor: React.FC<{
+const InputOptions: React.FC<{
+    editCtx: IEditContext,
+    comp: IComp<IInputConfig>,
+    exeComp: IExeComp<ICompDataInput> | null,
+}> = memo(function InputEditor({ editCtx, comp }) {
+    let [, setEditorState] = useEditorContext();
+
+    let editBitWidth = makeEditFunction(setEditorState, editCtx, comp, (value: number) => ({ bitWidth: value }));
+    let editSigned = makeEditFunction(setEditorState, editCtx, comp, (value: boolean) => ({
+        signed: value,
+        value: clampToSignedWidth(comp.args.value, comp.args.bitWidth, value),
+    }));
+
+    function editValue(end: boolean, value: number, valueMode: HexValueInputType) {
+        setEditorState(editCompConfig(editCtx, end, comp, a => assignImm(a, { value, valueMode })));
+    }
+
+    return <>
+        <EditKvp label='Value'>
+            <HexValueEditor
+                inputType={comp.args.valueMode}
+                value={comp.args.value}
+                update={editValue}
+                maxBits={comp.args.bitWidth}
+                padBits={comp.args.bitWidth}
+                signed={comp.args.signed}
+                minimalBackground
+            />
+        </EditKvp>
+        <EditKvp label='Signed'>
+            <BooleanEditor value={comp.args.signed} update={editSigned} />
+        </EditKvp>
+    </>;
+});
+
+
+const InputEditor: React.FC<{
     editCtx: IEditContext,
     isActive: boolean,
     comp: IComp<IInputConfig>,
     exeComp: IExeComp<ICompDataInput>, styles: any,
 }> = memo(function InputEditor({ editCtx, comp, isActive }) {
-    let { setEditorState } = useEditorContext();
+    let [, setEditorState] = useEditorContext();
 
     let editBitWidth = makeEditFunction(setEditorState, editCtx, comp, (value: number) => ({ bitWidth: value }));
     let editSigned = makeEditFunction(setEditorState, editCtx, comp, (value: boolean) => ({
@@ -144,7 +217,7 @@ export const InputEditor: React.FC<{
     return <>
         <CompRectBase comp={comp} className={s.inputNumber} hideHover={true}>
             <HexValueEditor
-                    className="absolute inset-0 px-2"
+                    className="absolute inset-0 px-2 text-2xl"
                     inputType={comp.args.valueMode}
                     value={comp.args.value}
                     update={editValue}

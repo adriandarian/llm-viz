@@ -1,8 +1,8 @@
 import { assert } from "console";
 import { AffineMat2d } from "../utils/AffineMat2d";
 import { BoundingBox3d, Vec3 } from "../utils/vector";
-import { IComp, IEditContext, IEditSchematic, IEditSnapshot, IEditorState, IElRef, ISchematic } from "./CpuModel";
-import { ICompDef } from "./comps/CompBuilder";
+import { IComp, IEditContext, IEditSchematic, IEditSnapshot, IEditorState, IElRef, ISchematic, IWireLabel } from "./CpuModel";
+import { IBaseCompConfig, ICompDef } from "./comps/CompBuilder";
 import { ISharedContext } from "./library/SharedContext";
 import { assignImm } from "../utils/data";
 
@@ -14,6 +14,12 @@ export function editCtxFromRefId(ref: IElRef): IEditContext {
 export function globalRefToLocal(ref: IElRef): IElRef {
     let prefixIdx = ref.id.lastIndexOf('|');
     return assignImm(ref, { id: ref.id.substring(prefixIdx + 1) });
+}
+
+export function globalRefToLocalIfMatch(ref: IElRef, idPrefix: string): IElRef | null {
+    let prefixIdx = ref.id.lastIndexOf('|');
+    let prefix = prefixIdx >= 0 ? ref.id.substring(0, prefixIdx + 1) : '';
+    return prefix === idPrefix ? assignImm(ref, { id: ref.id.substring(prefixIdx + 1) }) : null;
 }
 
 export function localRefToGlobal(ref: IElRef, editCtx: IEditContext): IElRef {
@@ -66,11 +72,14 @@ export function computeSubLayoutMatrix(comp: IComp, subSchematic: ISchematic) {
         bb = new BoundingBox3d(new Vec3(), comp.size.mul(2.5));
     }
 
+    let compSize = comp.size.sub(new Vec3(1, 1));
+    let compPos = comp.pos.add(new Vec3(0.5, 0.5));
+
     let bbSize = bb.size();
-    let scale = Math.min(comp.size.x / bbSize.x, comp.size.y / bbSize.y);
+    let scale = Math.min(compSize.x / bbSize.x, compSize.y / bbSize.y);
 
     let subMtx = AffineMat2d.multiply(
-        AffineMat2d.translateVec(comp.pos.mulAdd(comp.size, 0.5)),
+        AffineMat2d.translateVec(compPos.mulAdd(compSize, 0.5)),
         AffineMat2d.scale1(scale),
         AffineMat2d.translateVec(bb.min.mul(-1).mulAdd(bbSize, -0.5)),
     );
@@ -111,6 +120,10 @@ export function getCompSubSchematicForSnapshot(sharedContext: ISharedContext, sn
         return null;
     }
 
+    if (comp.defId === 'core/flow/mux2') {
+        return null;
+    }
+
     if (comp.subSchematicId) {
         let editSchematic = snapshot.subSchematics[comp.subSchematicId];
         if (editSchematic) {
@@ -119,7 +132,7 @@ export function getCompSubSchematicForSnapshot(sharedContext: ISharedContext, sn
 
         let schemLibEntry = sharedContext.schematicLibrary.getSchematic(comp.subSchematicId);
 
-        return schemLibEntry?.model.mainSchematic ?? null;
+        return schemLibEntry?.snapshot.mainSchematic ?? null;
     }
 
     let compDef = sharedContext.compLibrary.getCompDef(comp.defId);
@@ -184,8 +197,19 @@ export function getParentCompsFromId(editorState: IEditorState, refId: string): 
     return parentComps;
 }
 
-export function getCompFromRef(editorState: IEditorState, refId: string): IComp | null {
-    let parts = refId.split('|');
+export function getCompFromRef(editorState: IEditorState, ref: IElRef): IComp<IBaseCompConfig> | null {
+    let [schematic, id] = getSchematicAndIdFromRef(editorState, ref);
+    return schematic?.comps.find(c => c.id === id) ?? null;
+}
+
+export function getWireLabelFromRef(editorState: IEditorState, ref: IElRef): IWireLabel | null {
+    let [schematic, id] = getSchematicAndIdFromRef(editorState, ref);
+    return schematic?.wireLabels.find(a => a.id === id) ?? null;
+}
+
+export function getSchematicAndIdFromRef(editorState: IEditorState, ref: IElRef): [IEditSchematic | null, string] {
+
+    let parts = ref.id.split('|');
     let snapshot = editorState.snapshotTemp ?? editorState.snapshot;
     let schematic: IEditSchematic = snapshot.mainSchematic;
 
@@ -195,18 +219,18 @@ export function getCompFromRef(editorState: IEditorState, refId: string): IComp 
         let comp = schematic.comps.find(c => c.id === part);
 
         if (!comp) {
-            return null;
+            return [null, ''];
         }
 
         let subSchematic = getCompSubSchematic(editorState, comp);
 
         if (!subSchematic) {
-            return null;
+            return [null, ''];
         }
 
         schematic = subSchematic;
     }
 
     let lastPartId = parts[parts.length - 1];
-    return schematic.comps.find(c => c.id === lastPartId) ?? null;
+    return [schematic, lastPartId];
 }

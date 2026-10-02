@@ -1,18 +1,22 @@
 import React, { memo, useEffect, useRef, useState } from 'react';
 import { AffineMat2d } from '../utils/AffineMat2d';
-import { assignImm, assignImmFull, clamp, getOrAddToMap } from '../utils/data';
+import { assignImm, assignImmFull, clamp, isNil, isNotNil } from '../utils/data';
 import { hasModifiers, isKeyWithModifiers, KeyboardOrder, Modifiers, useGlobalKeyboard } from '../utils/keyboard';
 import { useCombinedMouseTouchDrag, useTouchEvents } from '../utils/pointer';
-import { BoundingBox3d, projectOntoVector, segmentNearestPoint, Vec3 } from '../utils/vector';
-import { ICanvasState, IEditSchematic, IEditSnapshot, IEditorState, IElRef, IHitTest, ISchematic, ISegment, IWireGraph, RefType } from './CpuModel';
-import { editMainSchematic, editSnapshot, editSubSchematic, useEditorContext } from './Editor';
-import { fixWire, wireToGraph, applyWires, checkWires, copyWireGraph, EPSILON, dragSegment, moveSelectedComponents, iterWireGraphSegments, refToString, wireUnlinkNodes, repackGraphIds } from './Wire';
-import s from './CpuCanvas.module.scss';
+import { BoundingBox3d, pointInTriangle, projectOntoVector, segmentNearestPoint, Vec3 } from '../utils/vector';
+import { ICanvasState, IEditSnapshot, IEditorState, IElRef, IHitTest, ISchematic, IWireGraph, RefSubType, RefType } from './CpuModel';
+import { canvasEvToModel, canvasEvToScreen, editMainSchematic, editSnapshot, editSubSchematic, modelToScreen, screenToModel, useEditorContext } from './Editor';
+import { fixWire, wireToGraph, applyWires, checkWires, copyWireGraph, EPSILON, dragSegment, moveSelectedComponents, iterWireGraphSegments, ISegment } from './Wire';
 import { CursorDragOverlay } from '../utils/CursorDragOverlay';
-import { computeSubLayoutMatrix, editCtxFromRefId as editCtxFromElRef, getActiveSubSchematic, getCompFromRef, getCompSubSchematic, getMatrixForEditContext, getSchematicForRef, globalRefToLocal } from './SubSchematics';
-import { useFunctionRef } from '../utils/hooks';
+import { computeSubLayoutMatrix, editCtxFromRefId as editCtxFromElRef, getActiveSubSchematic, getCompSubSchematic, getMatrixForEditContext, getSchematicForRef, globalRefToLocal, globalRefToLocalIfMatch } from './SubSchematics';
+import { useFunctionRef, useRequestAnimationFrame } from '../utils/hooks';
 import { copySelection, cutSelection, pasteSelection } from './Clipboard';
 import { deleteSelection } from './Selection';
+import { compIsVisible } from './ModelHelpers';
+import { constructSubCanvasState, shouldRenderComp } from './render/CanvasRenderHelpers';
+import { multiSortStableAsc } from '../utils/array';
+import { rotateCompIsHoriz, rotateCompPortPos } from './comps/CompHelpers';
+import { wireLabelTriangle } from './render/WireLabelRender';
 
 export const CanvasEventHandler: React.FC<{
     embedded?: boolean;
@@ -22,10 +26,9 @@ export const CanvasEventHandler: React.FC<{
 
     let [ctrlDown, setCtrlDown] = useState(false);
     let [canvasWrapEl, setCanvasWrapEl] = useState<HTMLDivElement | null>(null);
-    let { editorState, setEditorState } = useEditorContext();
+    let [editorState, setEditorState] = useEditorContext({ });
 
-
-    useGlobalKeyboard(KeyboardOrder.MainPage, ev => {
+    let keyboardManager = useGlobalKeyboard(KeyboardOrder.MainPage, ev => {
         if (ev.key === "Control") {
             setCtrlDown(ev.type === "keydown");
         }
@@ -60,7 +63,7 @@ export const CanvasEventHandler: React.FC<{
     useEffect(() => {
         if (canvasWrapEl) {
             function wheelHandler(ev: WheelEvent) {
-                if (!embedded || hasModifiers(ev, Modifiers.CtrlOrCmd)) {
+                if (!embedded || hasModifiers(ev, Modifiers.CtrlOrCmd) || keyboardManager.isFocused) {
                     handleWheelFuncRef.current(ev);
                 }
             }
@@ -69,11 +72,15 @@ export const CanvasEventHandler: React.FC<{
                 canvasWrapEl!.removeEventListener("wheel", wheelHandler);
             };
         }
-    }, [canvasWrapEl, handleWheelFuncRef, embedded]);
-
+    }, [canvasWrapEl, handleWheelFuncRef, embedded, keyboardManager]);
 
     useTouchEvents(canvasWrapEl, { mtx: editorState.mtx }, { alwaysSendDragEvent: true },
         function handle1PointDrag(ev, ds) {
+            if (embedded) {
+                // could show that "drag with 2 fingers" thing, nahhh
+                return;
+            }
+
             let aPt0 = new Vec3(ds.touches[0].clientX, ds.touches[0].clientY);
             let bPt0 = new Vec3(ev.touches[0].clientX, ev.touches[0].clientY);
             let delta = bPt0.sub(aPt0);
@@ -126,6 +133,7 @@ export const CanvasEventHandler: React.FC<{
             mtx: mtx,
             hovered: hovered,
             modelPos: evToModel(ev, mtx),
+            editCtx: editCtx,
             ctrlDown: ctrlDown,
             isSelecting: (ev.button === 0 && ctrlDown) || ev.button === 2,
         };
@@ -133,19 +141,17 @@ export const CanvasEventHandler: React.FC<{
 
         let selection = document.getSelection();
         selection?.removeAllRanges();
-
-        let delta = new Vec3(ev.clientX - ds.clientX, ev.clientY - ds.clientY);
+        let mtxLocal = getMatrixForEditContext(ds.data.editCtx, editorState);
 
         if (ds.data.isSelecting) {
-            let endPos = evToModel(ev, ds.data.mtx);
+            let endPos = evToModel(ev, editorState.mtx);
             let startPos = ds.data.modelPos;
             let bb = new BoundingBox3d(startPos, endPos);
 
             let [idPrefix, schematic] = getActiveSubSchematic(editorState);
 
             let compRefs = schematic.comps.filter(c => {
-                let bb2 = new BoundingBox3d(c.pos, c.pos.add(c.size));
-                return bb.intersects(bb2);
+                return bb.intersects(c.bb);
             }).map(c => ({ type: RefType.Comp, id: idPrefix + c.id }));
 
             let wireRefs = schematic.wires.flatMap(w => {
@@ -167,33 +173,49 @@ export const CanvasEventHandler: React.FC<{
                 return [...nodeRefs, ...segRefs];
             });
 
+            let labelAnchorRefs = schematic.wireLabels.filter(l => {
+                let rectTl = l.anchorPos.add(l.rectRelPos);
+                let rectBb = new BoundingBox3d(rectTl, rectTl.add(l.rectSize));
+
+                return bb.contains(l.anchorPos) || bb.intersects(rectBb);
+            }).map(l => ({ type: RefType.WireLabel, id: idPrefix + l.id }));
 
             setEditorState(a => assignImm(a, {
                 selectRegion: end ? null : { bbox: bb, idPrefix: '' },
                 snapshot: assignImm(a.snapshot, {
-                    selected: [...compRefs, ...wireRefs],
+                    selected: [...compRefs, ...wireRefs, ...labelAnchorRefs],
+                    selectionRotateCenter: null,
                 }),
             }));
 
         } else if (!ds.data.hovered) {
-            let newMtx = AffineMat2d.translateVec(delta).mul(ds.data.baseMtx);
-            setEditorState(a => assignImm(a, { mtx: newMtx }));
+            if (ev.type.startsWith("touch")) {
+                return;
+            }
+
+            let delta = new Vec3(ev.clientX - ds.clientX, ev.clientY - ds.clientY);
+            let newMtx = AffineMat2d.multiply(AffineMat2d.translateVec(delta), ds.data.baseMtx);
+            setEditorState(a => assignImm(a, {
+                dragCreateComp: undefined,
+                mtx: newMtx,
+            }));
         } else {
-            let mtx = ds.data.mtx;
             let hoveredRef = ds.data.hovered.ref;
 
             if (hoveredRef.type === RefType.Comp) {
                 let isSelected = editorState!.snapshot.selected.find(a => a.type === RefType.Comp && a.id === hoveredRef.id);
                 if (isSelected) {
                     // handleComponentDrag(end, hoveredRef, ds.data.modelPos, evToModel(ev));
-                    handleSelectionDrag(end, ds.data.modelPos, evToModel(ev, mtx));
+                    handleSelectionDrag(end, ds.data.modelPos, evToModel(ev, mtxLocal));
                 }
             } else if (hoveredRef.type === RefType.CompNode) {
-                handleWireCreateDrag(end, hoveredRef, ds.data.modelPos, evToModel(ev, mtx));
+                handleWireCreateDrag(end, hoveredRef, ds.data.modelPos, evToModel(ev, mtxLocal));
             } else if (hoveredRef.type === RefType.WireSeg) {
-                handleWireDrag(end, hoveredRef, ds.data.modelPos, evToModel(ev, mtx));
+                handleWireDrag(end, hoveredRef, ds.data.modelPos, evToModel(ev, mtxLocal));
             } else if (hoveredRef.type === RefType.WireNode) {
-                handleWireExtendDrag(end, hoveredRef, ds.data.modelPos, evToModel(ev, mtx), mtx);
+                handleWireExtendDrag(end, hoveredRef, ds.data.modelPos, evToModel(ev, mtxLocal), mtxLocal);
+            } else if (hoveredRef.type === RefType.WireLabel) {
+                handleWireLabelAnchorDrag(end, hoveredRef, ds.data.modelPos, evToModel(ev, mtxLocal), mtxLocal);
             }
         }
 
@@ -206,12 +228,15 @@ export const CanvasEventHandler: React.FC<{
             setEditorState(a => assignImm(a, {
                 snapshot: assignImm(a.snapshot, {
                     selected: [hoveredRef],
+                    selectionRotateCenter: null,
                 }),
             }));
         } else {
             setEditorState(a => assignImm(a, {
+                dragCreateComp: undefined,
                 snapshot: assignImm(a.snapshot, {
                     selected: [],
+                    selectionRotateCenter: null,
                 }),
             }));
         }
@@ -227,29 +252,29 @@ export const CanvasEventHandler: React.FC<{
         setEditorState(editMainSchematic(end, (schematic, state, snapshot) => {
             let deltaPos = newModelPos.sub(origModelPos);
             let snappedDelta = snapToGrid(deltaPos);
-            return moveSelectedComponents(schematic, snapshot.selected, snappedDelta);
+            return moveSelectedComponents(state, schematic, snapshot.selected, snappedDelta);
         }));
     }
 
     function handleWireCreateDrag(end: boolean, globalRef: IElRef, origModelPos: Vec3, newModelPos: Vec3) {
         let editCtx = editCtxFromElRef(globalRef);
         let ref = globalRefToLocal(globalRef);
-        setEditorState(editSubSchematic(editCtx, end, schematic => {
+        setEditorState(editSubSchematic(editCtx, end, function handleWireCreateDrag(schematic) {
             let startComp = schematic.comps.find(c => c.id === ref.id);
             if (!startComp) {
                 console.log(`WARN: handleWireCreateDrag: comp '${ref.id}' not found`);
                 return schematic;
             }
-            let startNode = startComp.ports.find(n => n.id === ref.compNodeId);
-            if (!startNode) {
+            let startPort = startComp.ports.find(n => n.id === ref.compNodeId);
+            if (!startPort) {
                 console.log(`WARN: handleWireCreateDrag: comp '${ref.id}' does not have the port '${ref.compNodeId}'`);
                 return schematic;
             }
 
-            let startPt = startComp.pos.add(startNode.pos);
+            let startPt = rotateCompPortPos(startComp, startPort);
             let endPt = snapToGrid(newModelPos);
 
-            let isHorizStart = startNode.pos.x === 0 || startNode.pos.x === startComp.size.x;
+            let isHorizStart = rotateCompIsHoriz(startComp, startPort.pos.x === 0 || startPort.pos.x === startComp.size.x);
 
             // split into horizontal and vertical segments
             // maybe drop some of the if's, and have a cleanup phase
@@ -386,13 +411,13 @@ export const CanvasEventHandler: React.FC<{
         let editCtx = editCtxFromElRef(globalRef);
         let ref = globalRefToLocal(globalRef);
 
-        setEditorState(editSubSchematic(editCtx, end, (layout) => {
-            let wireIdx = layout.wires.findIndex(w => w.id === ref.id);
+        setEditorState(editSubSchematic(editCtx, end, function handleWireDrag(schematic) {
+            let wireIdx = schematic.wires.findIndex(w => w.id === ref.id);
             if (wireIdx === -1) {
                 console.log(`WARN: handleWireDrag: wire ${ref.id} not found`)
-                return layout;
+                return schematic;
             }
-            let wire = layout.wires[wireIdx];
+            let wire = schematic.wires[wireIdx];
             let delta = newModelPos.sub(origModelPos);
             let node0 = wire.nodes[ref.wireNode0Id!];
             let node1 = wire.nodes[ref.wireNode1Id!];
@@ -400,7 +425,7 @@ export const CanvasEventHandler: React.FC<{
             // don't allow dragging of segments connected to components (since they're pinned)
             // probably want to support dragging by introducing a perp-segment though
             if (node0.ref || node1.ref) {
-                return layout;
+                return schematic;
             }
 
             let isHoriz = node0.pos.y === node1.pos.y;
@@ -412,66 +437,174 @@ export const CanvasEventHandler: React.FC<{
 
             let newWire = dragSegment(wire, ref.wireNode0Id!, ref.wireNode1Id!, delta);
 
-            let wires = [...layout.wires];
+            let wires = [...schematic.wires];
             wires[wireIdx] = newWire;
-            return applyWires(layout, wires, wireIdx);
+            return applyWires(schematic, wires, wireIdx);
         }));
     }
 
+    function handleWireLabelAnchorDrag(end: boolean, globalRef: IElRef, origModelPos: Vec3, newModelPos: Vec3, mtx: AffineMat2d) {
+        let editCtx = editCtxFromElRef(globalRef);
+        let ref = globalRefToLocal(globalRef);
+        setEditorState(editSubSchematic(editCtx, end, (schematic) => {
+            let labelIdx = schematic.wireLabels.findIndex(l => l.id === ref.id);
+            if (labelIdx === -1) {
+                console.log(`WARN: handleWireLabelAnchorDrag: label ${ref.id} not found`)
+                return schematic;
+            }
+            let label = schematic.wireLabels[labelIdx];
+            let delta = newModelPos.sub(origModelPos);
+            let newAnchorPos = label.anchorPos.add(delta);
+            // snap to mid-points on grid edges. I.e. if one axis is 0.0, the other axis is 0.5
+
+            let nearestWire: IWireGraph = null!;
+            let nearestWirePos: Vec3 | null = null;
+            let nearestDist = 0;
+            for (let wire of schematic.wires) {
+                iterWireGraphSegments(wire, (node0, node1) => {
+                    let nearestModelP = segmentNearestPoint(node0.pos, node1.pos, newAnchorPos);
+                    let dist = nearestModelP.dist(newAnchorPos);
+                    if (dist < 2 && (!nearestWire || dist < nearestDist)) {
+                        nearestWire = wire;
+                        nearestDist = dist;
+                        nearestWirePos = nearestModelP;
+                    }
+                });
+            }
+
+            if (nearestWirePos) {
+                newAnchorPos = nearestWirePos;
+            } else {
+                newAnchorPos = newAnchorPos.round();
+            }
+
+            let newLabel = assignImm(label, {
+                anchorPos: newAnchorPos,
+                wireId: nearestWire?.id ?? '',
+            });
+            let newLabels = [...schematic.wireLabels];
+            newLabels[labelIdx] = newLabel;
+            return assignImm(schematic, { wireLabels: newLabels });
+        }));
+    }
+
+    const scalePowerBase = 1.0013;
+
     function handleWheel(ev: WheelEvent) {
-        setEditorState(a => {
-            let scale = a.mtx.a;
-            let newScale = clamp(scale * Math.pow(1.0013, -ev.deltaY), 0.01, 100000) / scale;
-
-            let modelPt = evToModel(ev, a.mtx);
-            let newMtx = AffineMat2d.multiply(
-                a.mtx,
-                AffineMat2d.translateVec(modelPt),
-                AffineMat2d.scale1(newScale),
-                AffineMat2d.translateVec(modelPt.mul(-1)));
-
-            return assignImm(a, { mtx: newMtx });
+        setEditorState(state => {
+            let scale = state.targetScale ?? state.mtx.a;
+            let newScale = clamp(scale * Math.pow(scalePowerBase, -ev.deltaY * 2), 0.01, 100000);
+            return assignImm(state, { targetScale: newScale, scaleModelPt: evToModel(ev, state.mtx) });
         });
         ev.stopPropagation();
         ev.preventDefault();
     }
 
-    function getRefUnderCursor(editorState: IEditorState, ev: React.MouseEvent, schematic?: ISchematic, mtx?: AffineMat2d, idPrefix: string = ''): IHitTest | null {
-        mtx ??= editorState.mtx;
-        schematic ??= editorState.snapshot.mainSchematic;
+    let zoomBitsRef = useRef({
+        initial: null as (number | null),
+        target: null as (number | null),
+        t: 0,
+     });
 
-        let mousePt = evToModel(ev, mtx);
+    useRequestAnimationFrame(isNotNil(editorState.targetScale), (dtSeconds) => {
+        if (isNil(editorState.targetScale)) {
+            return;
+        }
+        let bits = zoomBitsRef.current;
+        let target = editorState.targetScale!;
+        if (bits.target !== target) {
+            bits.initial = editorState.mtx.a;
+            bits.target = target;
+            bits.t = 0;
+        }
+
+        bits.t += dtSeconds / 0.08; // t goes from 0 to 1 in 80ms
+
+        let initial = bits.initial!;
+
+        let isComplete = bits.t >= 1.0;
+        if (isComplete) {
+            bits.initial = null;
+            bits.target = null;
+            bits.t = 0;
+        }
+
+        // target = initial * Math.pow(scalePowerBase, someValue)
+        // someValue = log(target / initial) / log(scalePowerBase)
+
+        const scalePowerBase = 1.0013;
+        let factor = Math.log(target / initial) / Math.log(scalePowerBase);
+        let scaleInterp = isComplete ? target : initial * Math.pow(scalePowerBase, factor * bits.t);
+
+        setEditorState(state => {
+            let scaleAmt = scaleInterp / state.mtx.a;
+
+            if (isNil(state.scaleModelPt)) {
+                return state;
+            }
+
+            let newMtx = AffineMat2d.multiply(
+                    state.mtx,
+                    AffineMat2d.translateVec(state.scaleModelPt!),
+                    AffineMat2d.scale1(scaleAmt),
+                    AffineMat2d.translateVec(state.scaleModelPt!.mul(-1)));
+
+            return assignImm(state, {
+                mtx: newMtx,
+                scaleModelPt: isComplete ? undefined : state.scaleModelPt,
+                targetScale: isComplete ? undefined : state.targetScale,
+            });
+        });
+    });
+
+    function getRefUnderCursor(editorState: IEditorState, cvsState: ICanvasState, ev: React.MouseEvent, schematic?: ISchematic, idPrefix: string = ''): IHitTest | null {
+        let mtx = cvsState.mtx;
+        schematic ??= (editorState.snapshotTemp ?? editorState.snapshot).mainSchematic;
+
+        let mousePtModel = evToModel(ev, mtx);
         let mousePtScreen = evToScreen(ev);
 
         let comps = schematic.comps;
 
-        let refsUnderCursor: IHitTest[] = [];
+        let singleSelectedRefGlobal = editorState.snapshot.selected.length === 1 ? editorState.snapshot.selected[0] : null;
+        let singleSelectedRef = singleSelectedRefGlobal ? globalRefToLocalIfMatch(singleSelectedRefGlobal, idPrefix) : null;
 
-        for (let i = comps.length - 1; i >= 0; i--) {
-            let comp = comps[i];
-            for (let node of comp.ports) {
-                let modelPos = comp.pos.add(node.pos);
-                let nodeScreenPos = modelToScreen(modelPos, mtx);
-                let modelDist = modelPos.dist(mousePt);
-                let screenDist = nodeScreenPos.dist(mousePtScreen);
-                if (screenDist < 10 || modelDist < 0.2) {
-                    refsUnderCursor.push({
-                        ref: { type: RefType.CompNode, id: idPrefix + comp.id, compNodeId: node.id },
-                        distPx: screenDist,
-                        modelPt: modelPos,
-                    });
-                }
-            }
-        }
+        let refsUnderCursor: IHitTest[] = [];
 
         if (!showTransparentComponents) {
             for (let i = comps.length - 1; i >= 0; i--) {
                 let comp = comps[i];
-                let bb = new BoundingBox3d(comp.pos, comp.pos.add(comp.size));
-                if (bb.contains(mousePt)) {
 
-                    if ((comp.hasSubSchematic || comp.subSchematicId) && editorState.maskHover !== comp.id) {
-                        let screenBb = mtx.mulBb(bb).shrinkInPlaceXY(20);
+                if (!compIsVisible(comp, idPrefix)) {
+                    continue;
+                }
+
+                let [compVisible, compPortsVisible, subSchematicVisible] = shouldRenderComp(comp, cvsState);
+
+                if (!compVisible) {
+                    continue;
+                }
+
+                if (compPortsVisible) {
+                    for (let port of comp.ports) {
+                        let modelPos = rotateCompPortPos(comp, port);
+                        let nodeScreenPos = modelToScreen(modelPos, mtx);
+                        let modelDist = modelPos.dist(mousePtModel);
+                        let screenDist = nodeScreenPos.dist(mousePtScreen);
+                        if (screenDist < 10) {
+                            refsUnderCursor.push({
+                                ref: { type: RefType.CompNode, id: idPrefix + comp.id, compNodeId: port.id },
+                                distPx: screenDist,
+                                modelPt: modelPos,
+                            });
+                        }
+                    }
+                }
+
+                if (comp.bb.contains(mousePtModel)) {
+
+                    if ((comp.hasSubSchematic || comp.subSchematicId) && editorState.maskHover !== comp.id && subSchematicVisible) {
+                        let screenBb = mtx.mulBb(comp.bb).shrinkInPlaceXY(20);
                         if (screenBb.contains(mousePtScreen)) {
                             // need some test of whether we can click through to the sub-schematic,
                             // since still want to be able to select the component itself. Also should
@@ -479,9 +612,10 @@ export const CanvasEventHandler: React.FC<{
                             let def = editorState.compLibrary.getCompDef(comp.defId);
                             let subSchematic = getCompSubSchematic(editorState, comp)!;
                             if (subSchematic && def) {
-                                let subMtx = mtx.mul(computeSubLayoutMatrix(comp, subSchematic));
+                                let subMtx = computeSubLayoutMatrix(comp, subSchematic);
+                                let subCvs = constructSubCanvasState(cvsState, subMtx, comp);
 
-                                let subRef = getRefUnderCursor(editorState, ev, subSchematic, subMtx, idPrefix + comp.id + '|');
+                                let subRef = getRefUnderCursor(editorState, subCvs, ev, subSchematic, idPrefix + comp.id + '|');
 
                                 if (subRef) {
                                     refsUnderCursor.push(subRef);
@@ -494,7 +628,7 @@ export const CanvasEventHandler: React.FC<{
                     refsUnderCursor.push({
                         ref: { type: RefType.Comp, id: idPrefix + comp.id },
                         distPx: 0,
-                        modelPt: mousePt,
+                        modelPt: mousePtModel,
                     });
                 }
             }
@@ -538,39 +672,109 @@ export const CanvasEventHandler: React.FC<{
             }
         }
 
-        return refsUnderCursor[0] ?? null;
+        let wireLabels = schematic.wireLabels;
+        for (let i = wireLabels.length - 1; i >= 0; i--) {
+            let wireLabel = wireLabels[i];
+
+            let pScreen = modelToScreen(wireLabel.anchorPos, mtx);
+
+            let anchorScreenDist = pScreen.dist(mousePtScreen);
+            let anchorModelDist = wireLabel.anchorPos.dist(mousePtModel);
+
+            if (anchorModelDist < 0.2 || anchorScreenDist < 16) {
+                refsUnderCursor.push({
+                    ref: { type: RefType.WireLabel, id: idPrefix + wireLabel.id, subType: RefSubType.WireLabelAnchor },
+                    distPx: anchorScreenDist,
+                    modelPt: wireLabel.anchorPos,
+                });
+            }
+
+            let labelTl = wireLabel.anchorPos.add(wireLabel.rectRelPos);
+            let labelBb = new BoundingBox3d(labelTl, labelTl.add(wireLabel.rectSize));
+            let cursorInLabel = labelBb.contains(mousePtModel);
+
+            if (singleSelectedRef?.type === RefType.WireLabel && singleSelectedRef.id === wireLabel.id) {
+                // the triangle is now part of the label hit region
+                let [leftIsNearest, trianglePoint] = wireLabelTriangle(wireLabel);
+                let inTriangle = pointInTriangle(mousePtModel, trianglePoint, leftIsNearest ? labelBb.tl() : labelBb.br(), leftIsNearest ? labelBb.bl() : labelBb.tr());
+                cursorInLabel = cursorInLabel || inTriangle;
+            }
+
+            if (cursorInLabel) {
+                refsUnderCursor.push({
+                    ref: { type: RefType.WireLabel, id: idPrefix + wireLabel.id, subType: RefSubType.WireLabelRect },
+                    distPx: 0,
+                    modelPt: mousePtModel,
+                });
+            }
+        }
+
+        let sorted = multiSortStableAsc(refsUnderCursor, [
+            a => {
+                switch (a.ref.type) {
+                    case RefType.WireLabel: return 0;
+                    case RefType.CompNode: return 1;
+                    case RefType.Comp: return 2;
+                    case RefType.WireNode: return 3;
+                    case RefType.WireSeg: return 4;
+                    default: return 4;
+                }
+            },
+            a => a.distPx,
+        ]);
+
+        return sorted[0] ?? null;
     }
+
+    let dragCreateComp = editorState.dragCreateComp;
 
     function handleMouseMove(ev: React.MouseEvent) {
 
-        if (editorState.dragCreateComp) {
-            let compOrig = editorState.dragCreateComp.compOrig;
+        if (dragCreateComp) {
+            let compOrig = dragCreateComp.compOrig;
+            let wireLabel = dragCreateComp.wireLabel;
             let mousePos = snapToGrid(evToModel(ev, editorState.mtx));
 
             let applyFunc = (a: IEditSnapshot): IEditSnapshot => {
                 // figure out which schematic we're in
                 // (assume the main one for now!)
 
-                let newComp = assignImm(compOrig, {
-                    id: '' + a.mainSchematic.nextCompId,
-                    pos: mousePos,
-                });
-                return assignImm(a, {
-                    mainSchematic: assignImm(a.mainSchematic, {
-                        nextCompId: a.mainSchematic.nextCompId + 1,
-                        comps: [...a.mainSchematic.comps, newComp],
-                    }),
-                });
+                if (compOrig) {
+                    let newComp = assignImm(compOrig, {
+                        id: '' + a.mainSchematic.nextCompId,
+                        pos: mousePos,
+                    });
+                    editorState.compLibrary.updateCompFromDef(newComp);
+                    return assignImm(a, {
+                        mainSchematic: assignImm(a.mainSchematic, {
+                            nextCompId: a.mainSchematic.nextCompId + 1,
+                            comps: [...a.mainSchematic.comps, newComp],
+                        }),
+                    });
+                } else if (wireLabel) {
+                    let newWireLabel = assignImm(wireLabel, {
+                        id: '' + a.mainSchematic.nextWireLabelId,
+                        anchorPos: mousePos,
+                    });
+                    return assignImm(a, {
+                        mainSchematic: assignImm(a.mainSchematic, {
+                            nextWireLabelId: a.mainSchematic.nextWireLabelId + 1,
+                            wireLabels: [...a.mainSchematic.wireLabels, newWireLabel],
+                        }),
+                    });
+                } else {
+                    return a;
+                }
             };
 
             setEditorState(a => assignImm(a, {
-                dragCreateComp: assignImm(a.dragCreateComp, { applyFunc }),
+                dragCreateComp: a.dragCreateComp ? assignImm(a.dragCreateComp, { applyFunc }) : undefined,
             }));
 
             return;
         }
 
-        let isect = getRefUnderCursor(editorState, ev);
+        let isect = getRefUnderCursor(editorState, cvsState, ev);
 
         setEditorState(a => assignImm(a, { hovered: assignImmFull(a.hovered, isect) }));
     }
@@ -633,25 +837,11 @@ export const CanvasEventHandler: React.FC<{
         return pt.round();
     }
 
-    function evToModel(ev: { clientX: number, clientY: number }, mtx: AffineMat2d) {
-        return mtx.mulVec3Inv(evToScreen(ev));
-    }
-
-    function evToScreen(ev: { clientX: number, clientY: number }) {
-        let bcr = cvsState?.canvas.getBoundingClientRect();
-        return new Vec3(ev.clientX - (bcr?.x ?? 0), ev.clientY - (bcr?.y ?? 0));
-    }
-
-    function modelToScreen(pt: Vec3, mtx: AffineMat2d) {
-        return mtx.mulVec3(pt);
-    }
-
-    function screenToModel(pt: Vec3, mtx: AffineMat2d) {
-        return mtx.mulVec3Inv(pt);
-    }
+    let evToScreen = (ev: { clientX: number, clientY: number }) => canvasEvToScreen(cvsState.canvas, ev);
+    let evToModel = (ev: { clientX: number, clientY: number }, mtx: AffineMat2d) => canvasEvToModel(cvsState.canvas, ev, mtx);
 
     return <div
-        className={s.canvasEventSurface}
+        className={"pointer-events-auto w-full h-full absolute cursor-grab"}
         ref={setCanvasWrapEl}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}

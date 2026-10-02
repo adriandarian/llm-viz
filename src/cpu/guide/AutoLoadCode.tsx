@@ -1,18 +1,20 @@
 'use client';
 
 import { useEffect } from "react";
-import { useEditorContext } from "../Editor";
+import { notifyExeModelUpdated, useEditorContext } from "../Editor";
 import { useGetCodeSuite } from "../library/CodeSuiteManager";
 import { isNotNil } from "@/src/utils/data";
 import { IExeComp } from "../CpuModel";
 import { IRomExeData } from "../comps/SimpleMemory";
+import { stepExecutionCombinatorial } from "../CpuExecution";
 
 export const AutoLoadCode: React.FC<{
     fileName: string,
     section?: string;
 }> = ({ fileName, section }) => {
-    let { editorState, setEditorState, exeModel } = useEditorContext();
+    let [editorState, setEditorState] = useEditorContext();
     let codeSuite = useGetCodeSuite(editorState.codeLibrary, fileName);
+    let exeModel = editorState.exeModel;
 
     useEffect(() => {
         if (exeModel && codeSuite && codeSuite.entries.length > 0 && editorState.snapshot.mainSchematic.comps.length > 0) {
@@ -35,7 +37,8 @@ export const AutoLoadCode: React.FC<{
                     romArr.set(entry.elfSection.arr);
                     romArr.fill(0, entry.elfSection.arr.length);
                     exeComp.data.updateCntr += 1;
-                    setEditorState(e => ({ ...e }));
+                    stepExecutionCombinatorial(exeModel);
+                    setEditorState(notifyExeModelUpdated);
                 }
             } else {
                 console.log(editorState.snapshot.mainSchematic.comps);

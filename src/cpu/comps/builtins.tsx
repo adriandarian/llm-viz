@@ -1,5 +1,5 @@
 import { createAluComps } from "./Alu";
-import { CompLibrary as CompLibrary, ICompBuilderArgs } from "./CompBuilder";
+import { ICompBuilderArgs } from "./CompBuilder";
 import { createRegisterComps } from "./Registers";
 import { createRiscvInsDecodeComps } from "./RiscvInsDecode";
 import { createRiscvExtraComps } from "./RiscvExtra";
@@ -11,6 +11,12 @@ import { createInputOutputComps } from "./InputOutput";
 import { createLedOutputComps } from "./peripheral/LedOutputSimple";
 import { createRegFileCtrlComps } from "./riscv/RegisterControl";
 import { createCompIoComps } from "./CompPort";
+import { createBitMappingComps } from "./BitMapping";
+import { createBitExpanderComps } from "./BitExpander";
+import { createBitComparitorComps } from "./BitComparitor";
+import { createBinaryGateMultiComps } from "./BinaryGatesMulti";
+import { createMathLogicComps } from "./MathLogic";
+import { CompLibrary } from "../library/CompLibrary";
 
 export function buildCompLibrary() {
     let compLibrary = new CompLibrary();
@@ -30,6 +36,11 @@ export function buildCompLibrary() {
         ...createLedOutputComps(args),
         ...createRegFileCtrlComps(args),
         ...createCompIoComps(args),
+        ...createBitMappingComps(args),
+        ...createBitExpanderComps(args),
+        ...createBitComparitorComps(args),
+        ...createBinaryGateMultiComps(args),
+        ...createMathLogicComps(args),
     ];
 
     for (let comp of comps) {

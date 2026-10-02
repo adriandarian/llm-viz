@@ -5,20 +5,11 @@ let withBundleAnalyzer = require("@next/bundle-analyzer")({
 });
 
 const nextConfig = {
-  reactStrictMode: false, // Recommended for the `pages` directory, default in `app`.
+  reactStrictMode: false,
   productionBrowserSourceMaps: true,
-  experimental: {
-    appDir: true,
-  },
-  redirects: async () => {
-    return [
-      {
-        source: "/llm-viz",
-        destination: "/llm",
-        permanent: true,
-      },
-    ];
-  }
+  // Always static HTML export for Cloudflare Pages / any static host.
+  // Dev-only file-write tooling lives outside the App Router (see scripts/dev-schematic-api.mjs).
+  output: 'export',
 };
 
 module.exports = withBundleAnalyzer(nextConfig);

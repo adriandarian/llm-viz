@@ -1,12 +1,12 @@
 import React, { memo } from 'react';
 import { Vec3 } from "@/src/utils/vector";
 import { IExePort, PortType, IComp, IoDir } from "../CpuModel";
-import { ICompBuilderArgs, ICompDef } from "./CompBuilder";
+import { IBaseCompConfig, ICompBuilderArgs, ICompDef } from "./CompBuilder";
 import { CompRectBase } from "./RenderHelpers";
 import s from './CompStyles.module.scss';
 import clsx from 'clsx';
 import { isNotNil } from '@/src/utils/data';
-import { FontType, makeCanvasFont } from '../CanvasRenderHelpers';
+import { FontType, makeCanvasFont } from '../render/CanvasRenderHelpers';
 
 export interface IRomExeData {
     addr: IExePort;
@@ -18,11 +18,11 @@ export interface IRomExeData {
     updateCntr: number;
 }
 
-export interface IRomConfig {
+export interface IRomConfig extends IBaseCompConfig {
     octView: boolean;
 }
 
-export interface IRamConfig {
+export interface IRamConfig extends IBaseCompConfig {
     sizeBytes: number
 }
 
@@ -43,7 +43,7 @@ export enum BusMemCtrlType {
 
 export function createSimpleMemoryComps(_args: ICompBuilderArgs): ICompDef<any>[] {
 
-    let romW = 35;
+    let romW = 32;
     let romH = 30;
     let rom: ICompDef<IRomExeData, IRomConfig> = {
         defId: 'mem/rom0',
@@ -85,7 +85,7 @@ export function createSimpleMemoryComps(_args: ICompBuilderArgs): ICompDef<any>[
             let fontScale = 0.8;
             ctx.save();
             ctx.beginPath();
-            ctx.rect(comp.pos.x, comp.pos.y, comp.size.x, comp.size.y);
+            ctx.rect(comp.pos.x + 0.5, comp.pos.y + 0.5, comp.size.x - 1, comp.size.y - 1);
             ctx.clip();
 
             ctx.font = makeCanvasFont(styles.fontSize * fontScale, FontType.Mono);
@@ -93,8 +93,8 @@ export function createSimpleMemoryComps(_args: ICompBuilderArgs): ICompDef<any>[
             let widthPerWord = widthPerChar * 3 * 4
             let padLeft = 0.5;
             let space = comp.size.x - padLeft * 2;
-            let xOffset = comp.pos.x + padLeft;
-            let yOffset = comp.pos.y + 0.5;
+            let xOffset = comp.pos.x + 0.5 + padLeft;
+            let yOffset = comp.pos.y + 1.0;
             let rowHeight = styles.lineHeight * fontScale;
 
             let numWordsPerRow = Math.floor(space / widthPerWord);
@@ -160,7 +160,7 @@ export function createSimpleMemoryComps(_args: ICompBuilderArgs): ICompDef<any>[
         },
     };
 
-    let ramW = 35;
+    let ramW = 32;
     let ramH = 30;
 
     let ram: ICompDef<IRamExeData, IRamConfig> = {
@@ -169,9 +169,9 @@ export function createSimpleMemoryComps(_args: ICompBuilderArgs): ICompDef<any>[
         name: "RAM",
         size: new Vec3(ramW, ramH),
         ports: [
-            { id: 'ctrl', name: 'Ctrl', pos: new Vec3(0, 2), type: PortType.In, width: 5 },
-            { id: 'addr', name: 'Addr', pos: new Vec3(0, 4), type: PortType.In, width: 32 },
-            { id: 'data', name: 'Data', pos: new Vec3(0, 6), type: PortType.Out | PortType.In | PortType.Tristate, width: 32 },
+            { id: 'ctrl', name: 'C', pos: new Vec3(0, 2), type: PortType.In, width: 5 },
+            { id: 'addr', name: 'A', pos: new Vec3(0, 4), type: PortType.In, width: 32 },
+            { id: 'data', name: 'D', pos: new Vec3(0, 6), type: PortType.Out | PortType.In | PortType.Tristate, width: 32 },
         ],
 
         build: (builder) => {
@@ -192,6 +192,7 @@ export function createSimpleMemoryComps(_args: ICompBuilderArgs): ICompDef<any>[
 
                 data.ioDir = isRead ? IoDir.Out : IoDir.In;
                 data.ioEnabled = isRead || isWrite;
+                addr.ioEnabled = isRead || isWrite;
 
                 // misaligned reads are not supported
                 if (isRead) {
@@ -206,7 +207,7 @@ export function createSimpleMemoryComps(_args: ICompBuilderArgs): ICompDef<any>[
                     data.ioEnabled = false;
                 }
 
-            }, [data.ctrl, data.addr, data.data], [data.data]);
+            }, [data.ctrl, data.addr], [data.data]);
 
             /*
             builder.addPhase(function ramWritePhase({ data: { ctrl, data: dataPort, ram32View, addr } }) {
@@ -249,7 +250,7 @@ export function createSimpleMemoryComps(_args: ICompBuilderArgs): ICompDef<any>[
                     ram32View[addr.value >> 2] = wordVal;
                     data.updateCntr += 1;
                 }
-            }, [], []);
+            }, [data.ctrl, data.data], []);
 
             return builder.build();
         },
@@ -261,6 +262,66 @@ export function createSimpleMemoryComps(_args: ICompBuilderArgs): ICompDef<any>[
         reset: (exeComp) => {
             exeComp.data.ram.fill(0);
             exeComp.data.updateCntr = 0;
+        },
+
+        render: ({ comp, ctx, cvs, exeComp, styles }) => {
+            if (!exeComp) {
+                return;
+            }
+            let fontScale = 0.8;
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(comp.pos.x + 0.5, comp.pos.y + 0.5, comp.size.x - 1, comp.size.y - 1);
+            ctx.clip();
+
+            ctx.font = makeCanvasFont(styles.fontSize * fontScale, FontType.Mono);
+            let widthPerChar = ctx.measureText('0').width;
+            let widthPerWord = widthPerChar * 3 * 4
+            let padLeft = 0.5;
+            let space = comp.size.x - padLeft * 2;
+            let xOffset = comp.pos.x + padLeft + 0.5;
+            let yOffset = comp.pos.y + 1.0;
+            let rowHeight = styles.lineHeight * fontScale;
+
+            let numWordsPerRow = Math.floor(space / widthPerWord);
+            let numBytesPerRow = numWordsPerRow * 4;
+
+            let targetAddr = exeComp.data.addr.value & ~0b11;
+
+            let targetAddrRow = (targetAddr / numBytesPerRow) >>> 0;
+            let targetAddrCol = targetAddr % numBytesPerRow;
+            let targetAddrY = yOffset + targetAddrRow * rowHeight;
+            let targetAddrX = xOffset + targetAddrCol * widthPerChar * 3;
+
+            ctx.fillStyle = '#0005';
+            ctx.beginPath();
+            ctx.roundRect(targetAddrX - 0.3, targetAddrY - 0.2, widthPerChar * 11 + 0.6, rowHeight, 0.5);
+            ctx.fill();
+
+            for (let i = 0; i < 32; i++) {
+                let x = xOffset;
+                let y = yOffset + i * rowHeight;
+
+                let wordStr = '';
+                for (let j = 0; j < numBytesPerRow; j++) {
+                    let byte = exeComp.data.ram[i * numBytesPerRow + j];
+                    let parts = byte.toString(16).padStart(2, '0');
+                    wordStr += `${parts[0]}${parts[1]} `;
+                }
+
+                ctx.fillStyle = wordStr === '' ? '#0005' : '#000';
+                ctx.textAlign = 'left';
+                ctx.textBaseline = 'top';
+
+                ctx.fillText(wordStr, x, y);
+            }
+
+            // let isActive = exeComp.data.addr.value >>> 2 === i;
+            // if (isActive) {
+                // ctx.fillRect(x - 0.2, y - 0.2, width + 0.4, styles.lineHeight);
+            // }
+
+            ctx.restore();
         },
 
         renderDom: ({ comp, exeComp, styles }) => {

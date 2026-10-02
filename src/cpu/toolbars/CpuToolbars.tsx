@@ -1,15 +1,12 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { faBook, faCheck, faChevronRight, faClockRotateLeft, faCodeFork, faExpand, faFileArrowDown, faFloppyDisk, faForward, faForwardFast, faForwardStep, faPause, faPlay, faPowerOff, faRedo, faRotateLeft, faSortNumericUp, faTimes, faUndo } from '@fortawesome/free-solid-svg-icons';
+import React, { memo, useEffect, useRef, useState } from 'react';
+import { faBook, faCheck, faChevronRight, faClockRotateLeft, faCodeFork, faExpand, faFileArrowDown, faFloppyDisk, faForward, faForwardFast, faPause, faPlay, faPowerOff, faRedo, faTimes, faUndo } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { assignImm, isNotNil } from '../../utils/data';
 import { useGlobalKeyboard, KeyboardOrder, isKeyWithModifiers, Modifiers } from '../../utils/keyboard';
 import { IBaseEvent } from '../../utils/pointer';
-import { editMainSchematic, editSnapshot, redoAction, undoAction, useEditorContext } from '../Editor';
-import clsx from 'clsx';
-import { Tooltip } from '../../utils/Tooltip';
+import { notifyExeModelUpdated, redoAction, undoAction, useEditorContext } from '../Editor';
 import { resetExeModel, stepExecutionCombinatorial, stepExecutionLatch } from '../CpuExecution';
 import { modifiersToString } from '../Keymap';
-import { ComponentAdder } from '../ComponentAdder';
 import { ToolbarButton, ToolbarDivider } from './ToolbarBasics';
 import { useInterval, useRequestAnimationFrame } from '@/src/utils/hooks';
 import { ToolbarTypes } from '../CpuModel';
@@ -17,15 +14,19 @@ import { ToolbarTypes } from '../CpuModel';
 export const MainToolbar: React.FC<{
     readonly?: boolean,
     toolbars?: ToolbarTypes[],
-}> = ({ readonly, toolbars }) => {
-    let { editorState, setEditorState } = useEditorContext();
+}> = memo(function MainToolbar({ readonly, toolbars }) {
+    let [editorState, setEditorState] = useEditorContext();
 
     useGlobalKeyboard(KeyboardOrder.MainPage, ev => {
         if (isKeyWithModifiers(ev, 'z', Modifiers.CtrlOrCmd)) {
             undo();
+            ev.stopPropagation();
+            ev.preventDefault();
         }
         if (isKeyWithModifiers(ev, 'y', Modifiers.CtrlOrCmd) || isKeyWithModifiers(ev, 'z', Modifiers.CtrlOrCmd | Modifiers.Shift)) {
             redo();
+            ev.stopPropagation();
+            ev.preventDefault();
         }
     });
 
@@ -57,15 +58,11 @@ export const MainToolbar: React.FC<{
         setEditorState(a => assignImm(a, { compLibraryVisible: !a.compLibraryVisible }));
     }
 
-    function handleNameChange(ev: IBaseEvent, value: string, end: boolean) {
-        setEditorState(editMainSchematic(end, a => assignImm(a, { name: value })));
-    }
-
     let undoAvailable = editorState.undoStack.length > 0;
     let redoAvailable = editorState.redoStack.length > 0;
 
     if (readonly) {
-        return <div className='top-1 left-1 h-12 bg-white drop-shadow-md flex'>
+        return <div className='top-1 left-1 h-12 bg-white flex'>
             {toolbars?.includes(ToolbarTypes.PlayPause) && <>
                 <StepperControls />
                 <ToolbarDivider />
@@ -77,7 +74,7 @@ export const MainToolbar: React.FC<{
         </div>;
     }
 
-    return <div className='h-12 bg-white drop-shadow-md flex'>
+    return <div className='h-12 bg-white flex'>
         <ToolbarButton icon={faFloppyDisk} onClick={save} tip={`Save (${modifiersToString('S', Modifiers.CtrlOrCmd)})`} />
         <ToolbarButton icon={faCodeFork} onClick={saveAs} notImpl tip={`Duplicate (${modifiersToString('S', Modifiers.CtrlOrCmd | Modifiers.Shift)})`} />
         <ToolbarButton icon={faFileArrowDown} onClick={saveToFile} tip={`Save To File`} />
@@ -98,19 +95,8 @@ export const MainToolbar: React.FC<{
         <ToolbarDivider />
 
         <ViewportControls />
-
-        <ToolbarDivider />
-
-        <ComponentAdder />
-
-        <ToolbarDivider />
-
-        <div className='min-w-[200px] h-full flex items-center'>
-            <div className='mr-2'>Name:</div>
-            <ToolbarNameEditor value={editorState.snapshot.mainSchematic.name} setValue={handleNameChange} />
-        </div>
     </div>;
-};
+});
 
 
 
@@ -181,39 +167,51 @@ const ToolbarNameEditor: React.FC<{
 export const StepperControls: React.FC<{
 
 }> = () => {
-    let { editorState, setEditorState, exeModel } = useEditorContext();
+    let [editorState, setEditorState] = useEditorContext();
+    let exeModel = editorState.exeModel;
+    editorState.exeModelUpdateCntr;
 
     useGlobalKeyboard(KeyboardOrder.MainPage, ev => {
         if (isKeyWithModifiers(ev, ' ', Modifiers.None)) {
             step();
+            ev.stopPropagation();
+            ev.preventDefault();
         }
         if (isKeyWithModifiers(ev, 'Backspace', Modifiers.None)) {
             resetSoft();
+            ev.stopPropagation();
+            ev.preventDefault();
         }
     });
 
     function resetHard() {
-        resetExeModel(exeModel, { hardReset: true });
-        stepExecutionCombinatorial(exeModel);
-        setEditorState(a => ({ ...a }));
+        if (exeModel) {
+            resetExeModel(exeModel, { hardReset: true });
+            stepExecutionCombinatorial(exeModel);
+            setEditorState(notifyExeModelUpdated);
+        }
     }
 
     function resetSoft() {
-        resetExeModel(exeModel, { hardReset: false });
-        stepExecutionCombinatorial(exeModel);
-        setEditorState(a => ({ ...a }));
+        if (exeModel) {
+            resetExeModel(exeModel, { hardReset: false });
+            stepExecutionCombinatorial(exeModel);
+            setEditorState(notifyExeModelUpdated);
+        }
     }
 
     function step() {
-        if (!exeModel.runArgs.halt) {
-            stepExecutionLatch(exeModel);
-        }
+        if (exeModel) {
+            if (!exeModel.runArgs.halt) {
+                stepExecutionLatch(exeModel);
+            }
 
-        if (!exeModel.runArgs.halt) {
-            stepExecutionCombinatorial(exeModel);
-        }
+            if (!exeModel.runArgs.halt) {
+                stepExecutionCombinatorial(exeModel);
+            }
 
-        setEditorState(a => ({ ...a }));
+            setEditorState(notifyExeModelUpdated);
+        }
     }
 
     let isPlaying = isNotNil(editorState.stepSpeed);
@@ -222,8 +220,12 @@ export const StepperControls: React.FC<{
     let animFrameEnabled = isPlaying && !intervalEnabled;
 
     function stepOrStop() {
+        if (!exeModel) {
+            return;
+        }
+
         if (exeModel.runArgs.halt) {
-            setEditorState(a => assignImm(a, { stepSpeed: undefined }));
+            setEditorState(a => notifyExeModelUpdated(assignImm(a, { stepSpeed: undefined })));
             return false;
         }
 
@@ -233,7 +235,7 @@ export const StepperControls: React.FC<{
 
         stepExecutionCombinatorial(exeModel);
 
-        setEditorState(a => ({ ...a }));
+        setEditorState(notifyExeModelUpdated);
 
         return !exeModel.runArgs.halt;
     }
@@ -281,7 +283,7 @@ export const StepperControls: React.FC<{
         setEditorState(a => assignImm(a, { stepSpeed: undefined }));
     }
 
-    let halted = exeModel.runArgs.halt && !isPlaying;
+    let halted = !!exeModel && exeModel.runArgs.halt && !isPlaying && editorState.exeModelUpdateCntr > 0;
 
     return <>
         <ToolbarButton icon={faPowerOff} disabled={false} onClick={resetHard} tip={"Hard reset: clear all memory"} />
@@ -296,9 +298,10 @@ export const StepperControls: React.FC<{
 const ViewportControls: React.FC<{
 
 }> = () => {
-    let { editorState, setEditorState, exeModel } = useEditorContext();
+    let [editorState, setEditorState] = useEditorContext();
 
     function handleExpand() {
+        console.log('expand');
         setEditorState(a => assignImm(a, { needsZoomExtent: true }));
     }
 

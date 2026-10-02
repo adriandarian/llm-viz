@@ -5,14 +5,14 @@
     font-family: monospace;
     display: flex;
     align-items: center;
-    font-size: 24px;
+    // font-size: 24px;
 }
 
 .prefix {
-    display: flex;
-    flex-direction: column;
-    text-align: right;
-    width: 28px;
+    // display: flex;
+    // flex-direction: column;
+    text-align: end;
+    width: 20px;
     line-height: 24px;
     pointer-events: auto;
 
@@ -27,13 +27,12 @@
     flex: 1 0 0;
     width: 100%;
     border: none;
-    background: none;
+    // background: none;
     font-size: inherit;
     color: inherit;
-    padding: 0;
+    // padding: 0;
     border-radius: 4px;
-    pointer-events: auto;
-    background-color: #fff3;
+    // background-color: #fff3;
 
     &:hover:not(.readonly) {
         background-color: #fff3;
@@ -51,9 +50,9 @@
         outline: none;
     }
 
-    &:focus:not(.readonly) {
-        background-color: #ffff;
-    }
+    // &:focus:not(.readonly) {
+    //     background-color: #ffff;
+    // }
 
     &.invalid {
         color: $color-red;

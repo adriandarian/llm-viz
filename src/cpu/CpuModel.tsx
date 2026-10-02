@@ -1,9 +1,11 @@
 import { AffineMat2d } from "../utils/AffineMat2d";
 import { BoundingBox3d, Vec3 } from "../utils/vector";
-import { CompLibrary, ICompDef } from "./comps/CompBuilder";
+import { ICompDef } from "./comps/CompBuilder";
+import { CompLibrary } from "./library/CompLibrary";
+import { ICompPortConfig } from "./comps/CompPort";
 import { CodeSuiteManager } from "./library/CodeSuiteManager";
 import { ISharedContext } from "./library/SharedContext";
-import { SchematicLibrary } from "./schematics/SchematicLibrary";
+import { SchematicLibrary } from "./library/SchematicLibrary";
 
 /* All components & schematics and each version of them is represented by a separate ILibraryItem.
 
@@ -34,16 +36,38 @@ export interface IExeRunArgs {
 export interface IExeSystem {
     comps: IExeComp[];
     nets: IExeNet[];
-    executionSteps: IExeStep[];
+    executionBlocks: IExeBlock[];
     latchSteps: IExeStep[]; // latches are done just prior to the next round of execution steps (it's useful to pause prior to latching)
     lookup: IExeSystemLookup;
     runArgs: IExeRunArgs;
     compLibrary: CompLibrary;
 }
 
+/* map full ids (e.g. "compA|innerCompB") to indexes into IExeSystem.comps & IExeSystem.nets */
 export interface IExeSystemLookup {
     compIdToIdx: Map<string, number>;
     wireIdToNetIdx: Map<string, number>;
+}
+
+export interface IExeBlock {
+    blockIdx: number;
+    enabled: boolean;
+
+    resolvedInitial: number[];
+    decrBlockTargets: IDecrBlockTarget[];
+
+    executionSteps: IExeStep[];
+
+    executed: boolean;
+    executionOrder: number;
+
+    resolvedRemaining: number[];
+    // include latchSteps here??
+}
+
+export interface IDecrBlockTarget {
+    blockIdx: number;
+    counterIdx: number;
 }
 
 export interface IExeStep {
@@ -64,14 +88,18 @@ export interface IExeComp<T = any> {
 }
 
 export interface IExePhase<T = any> {
-    readPortIdxs: number[];
-    writePortIdxs: number[];
+    exeBlockIdx: number;
+    readPortIdxs: number[]; // index into IExeComp.ports[i] (the comp phase will read from these ports)
+    writePortIdxs: number[]; // index into IExeComp.ports[i] (the comp phase will write to these ports)
+    requiresOnePortIdxs: number[] | null; // index into IExeComp.ports[i] (at least one of these ports must be resolved)
     func: (comp: IExeComp<T>, args: IExeRunArgs) => void;
     isLatch: boolean;
+
+    portsHaveDecrBlockTargets: boolean;
 }
 
 export interface IExePort {
-    portIdx: number; // into IComp.ports[i]
+    portIdx: number; // into IExeComp.ports[i]
     netIdx: number;
     width: number;
     type: PortType;
@@ -79,6 +107,14 @@ export interface IExePort {
     ioDir: IoDir; // for rendering. Only needed to be set when is a bidirectional port
     dataUsed: boolean; // for rendering, and involves back-propagation (but typically follows ioEnabled)
     value: number;
+    hasFloatingValue: boolean;
+    floating: boolean; // no value has been set on a tristate wire. can either be a circuit error, or allow ports to later write a value to the net
+    resolved: boolean;
+    nestedPort?: IExePortRef; // for back-prop
+
+    // as this port is resolved (via the comp), we'll decrement the remaining count on the block at index waitingCounterId. When they all hit zero, we can execute the block
+    waitingBlockIdx: number;
+    waitingCounterIdx: number;
 }
 
 export enum IoDir {
@@ -88,25 +124,47 @@ export enum IoDir {
 }
 
 export interface IExeNet {
+    exeBlockIdx: number;
     idx: number;
     wire: IWireGraph; // a (maybe) rendered wire
+
+    /** The full wire id including a nested path.
+     *
+     * The IExeNet.wire ref above may be shared among a number of IExeNet's (such as a duplicated
+     * component), but the wireFullId is unique across IExeNet's. */
     wireFullId: string;
-    inputs: IExePortRef[]; // will have multiple inputs for buses (inputs with tristate)
-    outputs: IExePortRef[];
+
+    /** Ports that write to the net ("src" is from the net's PoV).
+     *
+     * Should only have multiple srcs if:
+     *   - it's a tristate net, and
+     *   - all the inputs are tristate (& only 1 may be enabled at runtime). */
+    srcs: IExePortRef[];
+
+    /** Ports that read from the net ("dest" is from the net's PoV).
+     *
+     * There can be many dests in the common case.
+     *
+     * For tristate nets, a dest can also be a src (for InOutTri ports).
+    */
+    dests: IExePortRef[];
+
     tristate: boolean;
     width: number;
     type: PortType;
     value: number;
     enabledCount: number;
+    resolved: boolean;
 }
 
-// in our execution data model, we use indexes rather than ids for perf
+// in our execution data model, we use indexes rather than ids for perf (?)
 export interface IExePortRef {
     comp: IComp;
     portIdx: number;
     exeComp: IExeComp
     exePort: IExePort;
     valid: boolean;
+    nestedPort: boolean;
 }
 
 // We're adding a new level of state, which tracks all editors (tabs), and they each have their own state (mostly).
@@ -121,6 +179,8 @@ export interface IProgramState {
 
 export interface IEditorState {
     mtx: AffineMat2d;
+    targetScale?: number;
+    scaleModelPt?: Vec3;
 
     snapshot: IEditSnapshot;
     snapshotTemp: IEditSnapshot | null;
@@ -131,11 +191,14 @@ export interface IEditorState {
     desiredSchematicId: string | null;
     activeSchematicId: string | null;
 
-    // time to combine these!! Actually, let's use CompLibrary, since it's used in more places, & rename it
     sharedContext: ISharedContext;
     compLibrary: CompLibrary;
     schematicLibrary: SchematicLibrary;
     codeLibrary: CodeSuiteManager;
+    wireRenderCache: IWireRenderCache;
+
+    exeModel: IExeSystem | null;
+    exeModelUpdateCntr: number;
 
     selectRegion: ISelectRegion | null;
     hovered: IHitTest | null;
@@ -157,7 +220,9 @@ export interface ISelectRegion {
 }
 
 export interface IDragCreateComp {
-    compOrig: IComp;
+    compOrig?: IComp;
+    wireLabel?: IWireLabel;
+
     applyFunc?: (a : IEditSnapshot) => IEditSnapshot;
 }
 
@@ -174,7 +239,58 @@ export interface ICanvasState {
     size: Vec3; // derived
     scale: number; // derived
     mtx: AffineMat2d; // derived
+    // mtxLocal: AffineMat2d; // derived
     tileCanvases: Map<string, HTMLCanvasElement>;
+
+    t: number;
+    rafHandle: number;
+}
+
+export interface IWireRenderCache {
+    lookupWire(editorState: IEditorState, idPrefix: string, wire: IWireGraph): IWireRenderInfo;
+    lookupCompPort(editorState: IEditorState, idPrefix: string, comp: IComp, portId: number): [wire: IWireRenderInfo, nodeId: number] | null;
+}
+
+// Things that are calculated by traversing the graph, based on the exeModel
+// this is used in multiple places besides just rendering the wires themselves (requiring caching)
+// e.g. drawing extra wire segments at the comp-ports that match the style, or manually drawing wires
+// within other components, like a mux or wire expander (that aren't sub-schematics).
+export interface IWireRenderInfo {
+    isCtrl: boolean;
+    isData: boolean;
+    isAddr: boolean;
+
+    exeNet: IExeNet | null;
+
+    isNonZero: boolean;
+    portBindings: Map<string, IWirePortBinding>; // key is the "compId:portId", matching the ref id on the node (ids local to the schematic)
+    flowSegs: Set<string>; // the direction of flow is given by id0 -> id1 in "id0:id1"
+    flowNodes: Set<number>; // nodes that are part of the flow (key is node index)
+
+    width: number;
+
+    bitWidth: number;
+    wireValue: number;
+
+    isHover: boolean;
+    isSelected: boolean;
+    selectedNodes: Set<number>; // key is node index
+    selectedSegs: Set<string>; // key is seg key ("id0:id1")
+
+    activeDestNodeCount: number;
+    activeSrcNodeCount: number;
+
+    destNodeCount: number;
+    srcNodeCount: number;
+
+    enabledCount: number;
+}
+
+export interface IWirePortBinding {
+    comp: IComp;
+    port: ICompPort;
+    exePort: IExePort;
+    nodeId: number;
 }
 
 export enum ToolbarTypes {
@@ -184,25 +300,29 @@ export enum ToolbarTypes {
 
 export interface IElRef {
     type: RefType;
+    /** This is a fullId, so includes the comp-tree prefix. */
     id: string;
     compNodeId?: string;
     wireNode0Id?: number;
     wireNode1Id?: number;
+    subType?: RefSubType;
 }
+
 
 export enum RefType {
     Comp,
     WireSeg,
     WireNode,
     CompNode,
+    WireLabel
+}
+
+export enum RefSubType {
+    WireLabelAnchor,
+    WireLabelRect,
 }
 
 export type IElement = IComp | ICompPort;
-
-export interface IWire {
-    id: string;
-    segments: ISegment[];
-}
 
 export interface IWireGraph {
     id: string;
@@ -216,11 +336,25 @@ export interface IWireGraphNode {
     ref?: IElRef;
 }
 
-export interface ISegment {
-    p0: Vec3;
-    p1: Vec3;
-    comp0Ref?: IElRef;
-    comp1Ref?: IElRef;
+export enum NumberRenderFlags {
+    None = 0,
+    Dec = 1 << 0,
+    Hex = 1 << 1,
+    Bin = 1 << 2,
+
+    Signed = 1 << 3,
+    Pad = 1 << 4, // pad with zeros, based on the wire bit-width
+}
+
+export interface IWireLabel {
+    id: string;
+    wireId: string;
+    anchorPos: Vec3;
+    rectRelPos: Vec3;
+    rectSize: Vec3;
+
+    text: string;
+    numRenderFlags: NumberRenderFlags;
 }
 
 export interface ICompRenderArgs<T, A = any> {
@@ -231,6 +365,19 @@ export interface ICompRenderArgs<T, A = any> {
     exeComp: IExeComp<T>;
     styles: IRenderStyles;
     isActive: boolean;
+    portBindingLookup: Map<string, IWirePortInfo>;
+    bb: BoundingBox3d;
+}
+
+export interface IWirePortInfo {
+    wireInfo: IWireRenderInfo;
+    portInfo: IWirePortBinding;
+}
+
+export interface ICompOptsRenderArgs<T, A = any> {
+    editCtx: IEditContext;
+    comp: IComp<A>;
+    exeComp: IExeComp<T> | null;
 }
 
 export interface IEditContext {
@@ -245,6 +392,23 @@ export interface IRenderStyles {
     fillColor: string;
 }
 
+
+export enum CompDefFlags {
+    None = 0,
+
+    // Actually all components must rotate now!
+    CanRotate = 1 << 0,
+
+    // Has a well-defined bit-width, along with the bitWidth field in args
+    HasBitWidth = 1 << 1,
+
+    // Can't be broken down further into sub-components
+    IsAtomic = 1 << 2,
+
+    // doesn't contain any gates
+    WiresOnly = 1 << 3,
+}
+
 export interface IComp<A = any> {
     id: string;
     defId: string;
@@ -253,10 +417,13 @@ export interface IComp<A = any> {
     subSchematicId?: string;
     pos: Vec3;
     size: Vec3;
+    rotation: number; // 0 = right, 1 = down, 2 = left, 3 = up
     ports: ICompPort[];
     args: A;
+    flags: CompDefFlags;
     resolved: boolean;
     hasSubSchematic: boolean;
+    bb: BoundingBox3d;
 }
 
 export interface ICompPort {
@@ -267,6 +434,12 @@ export interface ICompPort {
     width?: number;
 }
 
+export enum RectSide {
+    Right = 0,
+    Bottom = 1,
+    Left = 2,
+    Top = 3,
+}
 
 export enum PortType {
     None = 0,
@@ -279,6 +452,8 @@ export enum PortType {
     Addr = 1 << 4,
     Ctrl = 1 << 5,
 
+    Hidden = 1 << 6,
+
     OutTri = Out | Tristate,
     InOutTri = In | Out | Tristate,
 }
@@ -286,13 +461,16 @@ export enum PortType {
 export interface ISchematic {
     comps: IComp[];
     wires: IWireGraph[];
+    wireLabels: IWireLabel[];
     compBbox: BoundingBox3d;
     parentCompDefId?: string;
+    parentComp?: IComp;
 }
 
 export interface IEditSnapshot {
     focusedIdPrefix: string | null; // where pastes will go, etc, and should point to a subSchematic. null means the top-level, mainSchematic
     selected: IElRef[];
+    selectionRotateCenter: Vec3 | null; // when rotating comps, we want the pivot point to be stable (it also has to be at integer coords), so we store it here
     mainSchematic: IEditSchematic;
     subSchematics: Record<string, IEditSchematic>;
 }
@@ -319,13 +497,18 @@ export interface IEditSchematic {
     name: string;
     comps: IComp[];
     wires: IWireGraph[];
-    compBbox: BoundingBox3d;
+    wireLabels: IWireLabel[];
 
     nextCompId: number;
     nextWireId: number;
+    nextWireLabelId: number;
 
     // this schematic uses a component from the compLibrary as its parent component
     parentCompDefId?: string;
+    parentComp?: IComp; // with some args
+
+    compBbox: BoundingBox3d;
+    innerDisplayBbox?: BoundingBox3d;
 
     // -- or --
 
@@ -334,12 +517,37 @@ export interface IEditSchematic {
     compPorts: ICompPort[];
 }
 
-export interface IMemoryMap {
-    romOffset: number;
-    ramOffset: number;
-    ioOffset: number;
-    ioSize: number;
 
-    rom: Uint8Array;
-    ram: Uint8Array;
+
+export interface ISchematicDef {
+    id: string;
+    name: string;
+    snapshot: IEditSnapshot;
+    compArgs?: ISchematicCompArgs; // a schematic may get wrapped into a component
+
+    hasEdits: boolean;
+    // when we switch between models, want to keep as much state around as possible
+    undoStack?: IEditSnapshot[];
+    redoStack?: IEditSnapshot[];
+    mtx?: AffineMat2d;
+    schematicStr?: string; // for LS update detection
+}
+
+export interface ISchematicCompArgs {
+    size: Vec3;
+    ports: ISubLayoutPort[];
+}
+
+export interface ISubLayoutPort {
+    id: string;
+    name: string
+    type: PortType;
+    pos: Vec3;
+    width?: number;
+}
+
+export interface IParentCompInfo {
+    parentToInnerMtx: AffineMat2d;
+    comp: IComp;
+    linkedCompPorts: Map<string, { compPort: IComp<ICompPortConfig>, port: ICompPort, innerPos: Vec3 }>;
 }

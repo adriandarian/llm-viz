@@ -5,7 +5,7 @@ import { editSnapshot, updateSubSchematic } from "./Editor";
 import { exportData, importData, } from "./ImportExport";
 import { deleteSelection } from "./Selection";
 import { copyWireGraph, repackGraphIds, splitIntoIslands } from "./Wire";
-import { CompLibrary } from "./comps/CompBuilder";
+import { CompLibrary } from "./library/CompLibrary";
 
 export function cutSelection(ev: KeyboardEvent, editorState: IEditorState, setEditorState: StateSetter<IEditorState>) {
     let schematic = selectionToSchematic(editorState);
@@ -56,7 +56,10 @@ export function pasteSelection(ev: KeyboardEvent, editorState: IEditorState, set
                     return newSchematic;
                 });
 
-                newSnapshot = assignImm(newSnapshot, { selected: newSelectionRefs });
+                newSnapshot = assignImm(newSnapshot, {
+                    selected: newSelectionRefs,
+                    selectionRotateCenter: null,
+                });
 
                 return newSnapshot;
             }));
@@ -81,6 +84,10 @@ export function mergeInSchematic(snapshot: IEditSchematic, srcSchematic: ISchema
         let newComp = compLibrary.create(comp.defId, comp.args);
         newComp.id = id;
         newComp.pos = comp.pos.add(delta);
+        newComp.rotation = comp.rotation;
+        newComp.subSchematicId = comp.subSchematicId;
+
+        compLibrary.updateCompFromDef(newComp);
 
         compIdRemap.set(comp.id, id);
         snapshot.comps.push(newComp);
@@ -121,6 +128,7 @@ export function readFromClipboard(): Promise<string> {
 export function selectionToSchematic(editorState: IEditorState): ISchematic {
     let selected = editorState.snapshot.selected;
 
+    let selectedWireLabelIds = new Set(selected.filter(a => a.type === RefType.WireLabel).map(a => a.id));
     let selectedCompIds = new Set(selected.filter(a => a.type === RefType.Comp).map(a => a.id));
     let selectedWireIds = new Map<string, IElRef[]>();
 
@@ -167,6 +175,7 @@ export function selectionToSchematic(editorState: IEditorState): ISchematic {
         compBbox: editorState.snapshot.mainSchematic.compBbox,
         comps: editorState.snapshot.mainSchematic.comps.filter(c => selectedCompIds.has(c.id)),
         wires: wires,
+        wireLabels: editorState.snapshot.mainSchematic.wireLabels.filter(l => selectedWireLabelIds.has(l.id)),
     };
 
     return snapshotPartial;
